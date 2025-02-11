@@ -353,16 +353,19 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             let eqe = loop {
                 if let Some(eqe) = eq.pop() {
                     eq_armed = false;
+                    tracing::info!("disarmed eq in init sequence after pop");
                     break eqe;
                 }
                 if !eq_armed {
                     eq.arm();
                     eq_armed = true;
+                    tracing::info!("armed eq in init sequence");
                     // Check if the event arrived while arming.
                     if let Some(eqe) = eq.pop() {
                         // Remove any pending interrupt events.
                         let _ = interrupt0.wait().now_or_never();
                         eq_armed = false;
+                        tracing::info!("disarmed eq in init sequence");
                         break eqe;
                     }
                 }
@@ -778,6 +781,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         if !self.eq_armed {
             self.eq.arm();
             self.eq_armed = true;
+            tracing::info!("armed eq in hwc_subscribe");
         }
         self.hwc_subscribed = true;
         interrupt
@@ -787,6 +791,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         let mut eq_found = false;
         while let Some(eqe) = self.eq.pop() {
             self.eq_armed = false;
+            tracing::info!("disarmed eq in process_all_eqs after pop");
             eq_found = true;
             match eqe.params.event_type() {
                 GDMA_EQE_COMPLETION => self.cq_armed = false,
@@ -822,6 +827,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         if !self.eq_armed && self.hwc_subscribed {
             self.eq.arm();
             self.eq_armed = true;
+            tracing::info!("armed eq in process_all_eqs eq_found={}", eq_found);
         }
         eq_found
     }
@@ -846,9 +852,9 @@ impl<T: DeviceBacking> GdmaDriver<T> {
     async fn process_eqs_or_wait(&mut self) -> anyhow::Result<()> {
         loop {
             if !self.eq_armed {
-                tracing::trace!("arming eq");
                 self.eq.arm();
                 self.eq_armed = true;
+                tracing::info!("armed eq in process_all_eqs_or_wait");
             }
             tracing::trace!("waiting for eq interrupt");
             let before_wait = std::time::Instant::now();
