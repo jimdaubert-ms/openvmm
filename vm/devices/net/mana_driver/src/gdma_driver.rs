@@ -845,20 +845,10 @@ impl<T: DeviceBacking> GdmaDriver<T> {
 
     async fn process_eqs_or_wait(&mut self) -> anyhow::Result<()> {
         loop {
-            if self.process_all_eqs() {
-                return Ok(());
-            }
-
             if !self.eq_armed {
                 tracing::trace!("arming eq");
                 self.eq.arm();
                 self.eq_armed = true;
-                // Check if the event arrived while arming.
-                if self.process_all_eqs() {
-                    // Remove any pending interrupt events.
-                    let _ = self.interrupts[0].as_mut().unwrap().wait().now_or_never();
-                    return Ok(());
-                }
             }
             tracing::trace!("waiting for eq interrupt");
             let before_wait = std::time::Instant::now();
@@ -891,6 +881,10 @@ impl<T: DeviceBacking> GdmaDriver<T> {
 
             if wait_failed {
                 return wait_result;
+            }
+
+            if self.process_all_eqs() {
+                return Ok(());
             }
         }
     }

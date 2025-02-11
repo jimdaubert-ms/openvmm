@@ -195,7 +195,7 @@ impl<T: IntoBytes + FromBytes + Immutable + KnownLayout> CqEq<T> {
             .with_arm(arm)
             .with_id(self.id)
             .with_tail(tail / size_of::<T>() as u32);
-        tracing::trace!(queue_type = ?self.queue_type, id = self.id, ?value, "cq/eq doorbell write");
+        tracing::info!(queue_type = ?self.queue_type, id = self.id, ?value, "cq/eq doorbell write tail={:#x} arm={}", tail, arm);
         self.doorbell.write(self.doorbell_addr, value.into());
     }
 
