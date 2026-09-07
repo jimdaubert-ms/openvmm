@@ -11,10 +11,14 @@ use crate::bnic_driver::BnicDriver;
 use crate::bnic_driver::WqConfig;
 use crate::gdma_driver::GdmaDriver;
 use crate::gdma_driver::InterruptCanary;
+use crate::gdma_driver::InterruptCanaryControl;
+use crate::gdma_driver::InterruptCanaryFailure;
+use crate::gdma_driver::InterruptCanaryReport;
 use crate::queues;
 use crate::queues::Doorbell;
 use crate::queues::DoorbellPage;
 use anyhow::Context;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::lock::Mutex;
 use gdma_defs::GdmaDevId;
@@ -78,6 +82,35 @@ struct Inner<T: DeviceBacking> {
     vport_link_status: Arc<Mutex<Vec<LinkStatus>>>,
     vf_reset_request_sender: Arc<Mutex<Option<mesh::Sender<bool>>>>,
     interrupt_canary: Mutex<Option<InterruptCanary>>,
+}
+
+async fn report_interrupt_canary_with_retry<T: DeviceBacking>(
+    inner: &Arc<Inner<T>>,
+    report: InterruptCanaryReport,
+    timer: &mut PolledTimer,
+) -> bool {
+    let report_deadline = std::time::Instant::now()
+        + Duration::from_millis(crate::gdma_driver::VTL2_INTERRUPT_CANARY_REPORT_RETRY_TIMEOUT_MS);
+
+    loop {
+        if inner
+            .gdma
+            .lock()
+            .await
+            .report_interrupt_canary(report)
+            .await
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= report_deadline {
+            return false;
+        }
+        timer
+            .sleep(Duration::from_millis(
+                crate::gdma_driver::VTL2_INTERRUPT_CANARY_REPORT_RETRY_INTERVAL_MS,
+            ))
+            .await;
+    }
 }
 
 impl<T: DeviceBacking> ManaDevice<T> {
@@ -353,6 +386,8 @@ impl<T: DeviceBacking> ManaDevice<T> {
             })
         };
         if let Some(mut interrupt) = canary_interrupt {
+            let (recovery_send, mut recovery_recv) =
+                futures::channel::mpsc::unbounded::<InterruptCanaryControl>();
             let inner = self.inner.clone();
             let timer_driver = driver_source.simple();
             let mut report_timer = PolledTimer::new(&timer_driver);
@@ -360,37 +395,34 @@ impl<T: DeviceBacking> ManaDevice<T> {
                 "mana-interrupt-canary",
                 async move {
                     loop {
-                        interrupt.wait().await;
-                        let report = {
-                            let mut canary = inner.interrupt_canary.lock().await;
-                            canary.as_mut().and_then(InterruptCanary::process_interrupt)
+                        let interrupt_wait = interrupt.wait().fuse();
+                        let recovery_wait = recovery_recv.next().fuse();
+                        futures::pin_mut!(interrupt_wait, recovery_wait);
+
+                        let report = futures::select! {
+                            _ = interrupt_wait => {
+                                let mut canary = inner.interrupt_canary.lock().await;
+                                canary.as_mut().and_then(InterruptCanary::process_interrupt)
+                            }
+                            control = recovery_wait => {
+                                let Some(control) = control else {
+                                    break;
+                                };
+                                if let Some(canary) =
+                                    inner.interrupt_canary.lock().await.as_mut()
+                                {
+                                    canary.process_control(control);
+                                }
+                                None
+                            }
                         };
                         if let Some(report) = report {
-                            let report_deadline = std::time::Instant::now()
-                                + Duration::from_millis(
-                                    crate::gdma_driver::
-                                        VTL2_INTERRUPT_CANARY_REPORT_RETRY_TIMEOUT_MS,
-                                );
-                            let acknowledged = loop {
-                                if inner
-                                    .gdma
-                                    .lock()
-                                    .await
-                                    .report_interrupt_canary(report)
-                                    .await
-                                {
-                                    break true;
-                                }
-                                if std::time::Instant::now() >= report_deadline {
-                                    break false;
-                                }
-                                report_timer
-                                    .sleep(Duration::from_millis(
-                                        crate::gdma_driver::
-                                            VTL2_INTERRUPT_CANARY_REPORT_RETRY_INTERVAL_MS,
-                                    ))
-                                    .await;
-                            };
+                            let acknowledged = report_interrupt_canary_with_retry(
+                                &inner,
+                                report,
+                                &mut report_timer,
+                            )
+                            .await;
                             if !acknowledged {
                                 tracing::error!(
                                     "VTL2 interrupt canary report retry deadline expired; \
@@ -413,6 +445,7 @@ impl<T: DeviceBacking> ManaDevice<T> {
             let inner = self.inner.clone();
             let timer_driver = driver_source.simple();
             let mut timer = PolledTimer::new(&timer_driver);
+            let mut report_timer = PolledTimer::new(&timer_driver);
             self.interrupt_canary_watchdog_task = Some(driver_source.simple().spawn(
                 "mana-interrupt-canary-watchdog",
                 async move {
@@ -422,7 +455,7 @@ impl<T: DeviceBacking> ManaDevice<T> {
                                 crate::gdma_driver::VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS as u64,
                             ))
                             .await;
-                        let report = {
+                        let (report, recovery_control) = {
                             let Some(mut canary) = inner.interrupt_canary.try_lock() else {
                                 continue;
                             };
@@ -432,15 +465,48 @@ impl<T: DeviceBacking> ManaDevice<T> {
                             if !canary.monitoring_enabled() {
                                 break;
                             }
-                            canary.observe()
+                            (canary.observe(), canary.recovery_control())
                         };
                         if let Some(report) = report {
-                            inner
-                                .gdma
-                                .lock()
-                                .await
-                                .report_interrupt_canary(report)
-                                .await;
+                            let acknowledged = report_interrupt_canary_with_retry(
+                                &inner,
+                                report,
+                                &mut report_timer,
+                            )
+                            .await;
+                            if !acknowledged {
+                                tracing::error!(
+                                    "VTL2 interrupt canary watchdog report retry deadline expired; \
+                                     leaving the EQ disarmed and disabling the canary without \
+                                     failing the MANA control plane"
+                                );
+                                if let Some(canary) = inner.interrupt_canary.lock().await.as_mut() {
+                                    canary.disable_monitoring();
+                                }
+                                break;
+                            }
+                            if report.failure == InterruptCanaryFailure::EqePendingNoInterrupt
+                                && recovery_send
+                                    .unbounded_send(InterruptCanaryControl::RecoverPending(report))
+                                    .is_err()
+                            {
+                                tracing::error!(
+                                    "VTL2 interrupt canary recovery task is unavailable"
+                                );
+                                if let Some(canary) = inner.interrupt_canary.lock().await.as_mut() {
+                                    canary.disable_monitoring();
+                                }
+                                break;
+                            }
+                        }
+                        if let Some(control) = recovery_control
+                            && recovery_send.unbounded_send(control).is_err()
+                        {
+                            tracing::error!("VTL2 interrupt canary recovery task is unavailable");
+                            if let Some(canary) = inner.interrupt_canary.lock().await.as_mut() {
+                                canary.disable_monitoring();
+                            }
+                            break;
                         }
                     }
                 },

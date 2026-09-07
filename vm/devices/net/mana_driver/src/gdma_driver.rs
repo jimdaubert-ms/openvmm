@@ -122,6 +122,8 @@ const VTL2_INTERRUPT_CANARY_MIN_DELAY_MS: u32 = 250;
 const VTL2_INTERRUPT_CANARY_MAX_DELAY_MS: u32 = 750;
 const VTL2_INTERRUPT_CANARY_COMPLETION_TIMEOUT_MS: u32 = 500;
 const VTL2_INTERRUPT_CANARY_PENDING_POLLS: u32 = 25;
+const VTL2_INTERRUPT_CANARY_RECOVERY_QUIET_POLLS: u32 = 100;
+const VTL2_INTERRUPT_CANARY_MAX_CONSECUTIVE_POLL_RECOVERIES: u32 = 32;
 const VTL2_INTERRUPT_CANARY_SHMEM_TIMEOUT_MS: u64 = 100;
 const VTL2_INTERRUPT_CANARY_SHMEM_POLL_MS: u64 = 1;
 pub(crate) const VTL2_INTERRUPT_CANARY_REPORT_RETRY_INTERVAL_MS: u64 = 500;
@@ -317,7 +319,7 @@ pub(crate) enum InterruptCanaryFailure {
     SequenceMismatch,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct InterruptCanaryReport {
     pub generation: u32,
     pub expected_sequence: u32,
@@ -328,6 +330,16 @@ pub(crate) struct InterruptCanaryReport {
     pub poll_count: u32,
     pub pending_ms: u32,
     pub failure: InterruptCanaryFailure,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InterruptCanaryControl {
+    RecoverPending(InterruptCanaryReport),
+    ArmAfterRecoveryQuiet {
+        generation: u32,
+        recovered_sequence: u32,
+        signal_count: u64,
+    },
 }
 
 #[derive(Default)]
@@ -354,7 +366,7 @@ impl InterruptCanaryWatchdog {
         event: Option<(u8, u32)>,
         interrupt_signal_count_before: u64,
         interrupt_signal_count_after: u64,
-    ) -> Option<(InterruptCanaryFailure, u32)> {
+    ) -> Option<(InterruptCanaryFailure, u32, u64)> {
         self.poll_count = self.poll_count.saturating_add(1);
 
         let Some(event) = event else {
@@ -401,6 +413,7 @@ impl InterruptCanaryWatchdog {
             failure,
             self.pending_polls
                 .saturating_mul(VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS),
+            interrupt_signal_count_after,
         ))
     }
 }
@@ -416,9 +429,23 @@ pub(crate) struct InterruptCanary {
     watchdog: InterruptCanaryWatchdog,
     rearm_after_report: bool,
     monitoring_enabled: bool,
+    poll_recovery_total: u32,
+    poll_recovery_consecutive: u32,
+    poll_recovery_validation_pending: bool,
+    recovery_quiet_sequence: Option<u32>,
+    recovery_quiet_signal_count: u64,
+    recovery_quiet_polls: u32,
+    recovery_arm_request_pending: bool,
+    recovery_eq_armed: bool,
+    recovery_quiet_counted_as_poll: bool,
 }
 
 impl InterruptCanary {
+    fn next_sequence(sequence: u32) -> u32 {
+        let sequence = sequence.wrapping_add(1);
+        if sequence == 0 { 1 } else { sequence }
+    }
+
     fn new(eq: Eq, interrupt: DeviceInterrupt, resources: ResourceArena, msix: u32) -> Self {
         let mut generation_bytes = [0_u8; 4];
         getrandom::fill(&mut generation_bytes).unwrap();
@@ -440,6 +467,15 @@ impl InterruptCanary {
             watchdog,
             rearm_after_report: false,
             monitoring_enabled: true,
+            poll_recovery_total: 0,
+            poll_recovery_consecutive: 0,
+            poll_recovery_validation_pending: false,
+            recovery_quiet_sequence: None,
+            recovery_quiet_signal_count: 0,
+            recovery_quiet_polls: 0,
+            recovery_arm_request_pending: false,
+            recovery_eq_armed: false,
+            recovery_quiet_counted_as_poll: false,
         }
     }
 
@@ -489,6 +525,10 @@ impl InterruptCanary {
     }
 
     pub(crate) fn process_interrupt(&mut self) -> Option<InterruptCanaryReport> {
+        if !self.monitoring_enabled {
+            return None;
+        }
+
         self.interrupt_count = self.interrupt_count.saturating_add(1);
         let mut event_found = false;
         let mut expected_event_found = false;
@@ -533,14 +573,49 @@ impl InterruptCanary {
         if event_found {
             self.watchdog.clear_pending(self.interrupt.signal_count());
             if failure.is_none() && expected_event_found {
-                self.expected_sequence = self.expected_sequence.wrapping_add(1);
-                if self.expected_sequence == 0 {
-                    self.expected_sequence = 1;
+                if self.poll_recovery_validation_pending {
+                    tracing::info!(
+                        generation = self.generation,
+                        sequence = self.expected_sequence,
+                        consecutive_poll_recoveries = self.poll_recovery_consecutive,
+                        total_poll_recoveries = self.poll_recovery_total,
+                        signal_count = self.interrupt.signal_count(),
+                        "VTL2 interrupt canary hardware delivery resumed after polling recovery"
+                    );
+                    self.poll_recovery_consecutive = 0;
                 }
+                if self.recovery_quiet_sequence.is_some() {
+                    self.recovery_quiet_sequence = None;
+                    self.recovery_eq_armed = false;
+                    self.recovery_quiet_counted_as_poll = false;
+                    self.poll_recovery_validation_pending = false;
+                }
+                self.expected_sequence = Self::next_sequence(self.expected_sequence);
                 self.eq.arm();
             } else {
                 self.rearm_after_report = true;
             }
+        } else if let Some(recovered_sequence) = self.recovery_quiet_sequence {
+            if self.recovery_eq_armed {
+                self.eq.ack();
+                self.recovery_eq_armed = false;
+                self.poll_recovery_validation_pending = false;
+            }
+            if self.recovery_quiet_counted_as_poll {
+                self.poll_recovery_total = self.poll_recovery_total.saturating_sub(1);
+                self.poll_recovery_consecutive = 0;
+                self.recovery_quiet_counted_as_poll = false;
+            }
+            self.recovery_quiet_signal_count = self.interrupt.signal_count();
+            self.recovery_quiet_polls = 0;
+            self.recovery_arm_request_pending = false;
+            tracing::warn!(
+                generation = self.generation,
+                recovered_sequence,
+                signal_count = self.recovery_quiet_signal_count,
+                consecutive_poll_recoveries = self.poll_recovery_consecutive,
+                "late VTL2 interrupt arrived during the polling-recovery quiet period"
+            );
         } else {
             failure = Some(self.make_report(0, 0, InterruptCanaryFailure::InterruptWithoutEqe));
             self.rearm_after_report = true;
@@ -565,7 +640,7 @@ impl InterruptCanary {
                 interrupt_signal_count_before,
                 interrupt_signal_count_after,
             )
-            .map(|(failure, pending_ms)| {
+            .map(|(failure, pending_ms, interrupt_signal_count)| {
                 let observed_sequence = event.map_or(0, |(_, sequence)| sequence);
                 let failure = match failure {
                     InterruptCanaryFailure::EqePendingNoInterrupt
@@ -576,8 +651,239 @@ impl InterruptCanary {
                     }
                     other => other,
                 };
-                self.make_report(observed_sequence, pending_ms, failure)
+                let mut report = self.make_report(observed_sequence, pending_ms, failure);
+                report.interrupt_count = interrupt_signal_count.try_into().unwrap_or(u32::MAX);
+                report
             })
+    }
+
+    pub(crate) fn recovery_control(&mut self) -> Option<InterruptCanaryControl> {
+        let recovered_sequence = self.recovery_quiet_sequence?;
+        if self.recovery_eq_armed {
+            return None;
+        }
+        let signal_count = self.interrupt.signal_count();
+
+        if signal_count != self.recovery_quiet_signal_count {
+            self.recovery_quiet_signal_count = signal_count;
+            self.recovery_quiet_polls = 0;
+            self.recovery_arm_request_pending = false;
+            self.recovery_eq_armed = false;
+            return None;
+        }
+
+        if self.recovery_arm_request_pending {
+            return None;
+        }
+
+        self.recovery_quiet_polls = self.recovery_quiet_polls.saturating_add(1);
+        if self.recovery_quiet_polls < VTL2_INTERRUPT_CANARY_RECOVERY_QUIET_POLLS {
+            return None;
+        }
+
+        self.recovery_arm_request_pending = true;
+        Some(InterruptCanaryControl::ArmAfterRecoveryQuiet {
+            generation: self.generation,
+            recovered_sequence,
+            signal_count,
+        })
+    }
+
+    pub(crate) fn process_control(&mut self, control: InterruptCanaryControl) {
+        match control {
+            InterruptCanaryControl::RecoverPending(report) => {
+                self.recover_pending_after_report(report)
+            }
+            InterruptCanaryControl::ArmAfterRecoveryQuiet {
+                generation,
+                recovered_sequence,
+                signal_count,
+            } => self.arm_after_recovery_quiet(generation, recovered_sequence, signal_count),
+        }
+    }
+
+    fn recover_pending_after_report(&mut self, report: InterruptCanaryReport) {
+        if report.failure != InterruptCanaryFailure::EqePendingNoInterrupt
+            || !self.monitoring_enabled
+        {
+            return;
+        }
+
+        if report.generation != self.generation
+            || report.queue_id != self.eq.id()
+            || report.expected_sequence != self.expected_sequence
+            || report.observed_sequence != self.expected_sequence
+        {
+            tracing::warn!(
+                generation = self.generation,
+                report_generation = report.generation,
+                expected_sequence = self.expected_sequence,
+                report_expected_sequence = report.expected_sequence,
+                report_observed_sequence = report.observed_sequence,
+                queue_id = self.eq.id(),
+                report_queue_id = report.queue_id,
+                "skipping stale VTL2 interrupt canary polling-recovery request"
+            );
+            return;
+        }
+
+        let signal_count = self.interrupt.signal_count();
+        if report.interrupt_count != u32::MAX && signal_count != u64::from(report.interrupt_count) {
+            tracing::warn!(
+                generation = self.generation,
+                sequence = self.expected_sequence,
+                report_signal_count = report.interrupt_count,
+                signal_count,
+                "skipping VTL2 interrupt canary polling recovery because a late signal arrived"
+            );
+            return;
+        }
+
+        let Some(eqe) = self.eq.peek() else {
+            tracing::info!(
+                generation = self.generation,
+                sequence = self.expected_sequence,
+                "skipping VTL2 interrupt canary polling recovery because the EQE was consumed"
+            );
+            return;
+        };
+        let observed_sequence = u32::from_le_bytes(eqe.data[..4].try_into().expect("known size"));
+        if eqe.params.event_type() != GDMA_EQE_TEST_EVENT
+            || observed_sequence != self.expected_sequence
+        {
+            tracing::error!(
+                generation = self.generation,
+                expected_sequence = self.expected_sequence,
+                event_type = eqe.params.event_type(),
+                observed_sequence,
+                "VTL2 interrupt canary polling recovery found a different EQE; preserving it"
+            );
+            self.disable_monitoring();
+            return;
+        }
+
+        if self.poll_recovery_consecutive >= VTL2_INTERRUPT_CANARY_MAX_CONSECUTIVE_POLL_RECOVERIES {
+            tracing::error!(
+                generation = self.generation,
+                sequence = self.expected_sequence,
+                consecutive_poll_recoveries = self.poll_recovery_consecutive,
+                total_poll_recoveries = self.poll_recovery_total,
+                "VTL2 interrupt canary polling-recovery limit reached; leaving the EQE pending"
+            );
+            self.disable_monitoring();
+            return;
+        }
+
+        let recovered_sequence = self.expected_sequence;
+        let _ = self.eq.pop().expect("peeked EQE should still be present");
+        self.expected_sequence = Self::next_sequence(self.expected_sequence);
+        // Publish the consumer without arming. A delayed interrupt for this EQE
+        // must be observed before socmana is allowed to generate the next probe.
+        self.eq.ack();
+        let signal_count_after_ack = self.interrupt.signal_count();
+        self.watchdog.clear_pending(signal_count_after_ack);
+        self.poll_recovery_validation_pending = false;
+        self.recovery_quiet_sequence = Some(recovered_sequence);
+        self.recovery_quiet_signal_count = signal_count_after_ack;
+        self.recovery_quiet_polls = 0;
+        self.recovery_arm_request_pending = false;
+        self.recovery_eq_armed = false;
+
+        if signal_count_after_ack != signal_count {
+            self.poll_recovery_consecutive = 0;
+            self.recovery_quiet_counted_as_poll = false;
+            tracing::warn!(
+                generation = self.generation,
+                recovered_sequence,
+                next_expected_sequence = self.expected_sequence,
+                signal_count_before_recovery = signal_count,
+                signal_count_after_ack,
+                "late VTL2 hardware interrupt arrived while the recovery command consumed the EQE"
+            );
+            return;
+        }
+
+        self.poll_recovery_total = self.poll_recovery_total.saturating_add(1);
+        self.poll_recovery_consecutive = self.poll_recovery_consecutive.saturating_add(1);
+        self.recovery_quiet_counted_as_poll = true;
+
+        tracing::warn!(
+            generation = self.generation,
+            recovered_sequence,
+            next_expected_sequence = self.expected_sequence,
+            signal_count = signal_count_after_ack,
+            consecutive_poll_recoveries = self.poll_recovery_consecutive,
+            total_poll_recoveries = self.poll_recovery_total,
+            quiet_ms =
+                VTL2_INTERRUPT_CANARY_RECOVERY_QUIET_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS,
+            "poll-consumed VTL2 interrupt canary EQE after acknowledged interrupt loss"
+        );
+    }
+
+    fn arm_after_recovery_quiet(
+        &mut self,
+        generation: u32,
+        recovered_sequence: u32,
+        signal_count: u64,
+    ) {
+        if generation != self.generation || self.recovery_quiet_sequence != Some(recovered_sequence)
+        {
+            return;
+        }
+
+        self.recovery_arm_request_pending = false;
+        let current_signal_count = self.interrupt.signal_count();
+        if current_signal_count != signal_count
+            || current_signal_count != self.recovery_quiet_signal_count
+        {
+            self.recovery_quiet_signal_count = current_signal_count;
+            self.recovery_quiet_polls = 0;
+            return;
+        }
+
+        if self.eq.peek().is_some() {
+            tracing::error!(
+                generation = self.generation,
+                recovered_sequence,
+                "VTL2 interrupt canary EQ became non-empty during recovery quiet period"
+            );
+            self.disable_monitoring();
+            return;
+        }
+
+        // Keep the recovery state active through the arm write. If the timed-out
+        // interrupt arrives concurrently, disarm again and restart the quiet period.
+        self.eq.arm();
+        let signal_count_after_arm = self.interrupt.signal_count();
+        if signal_count_after_arm != current_signal_count {
+            self.eq.ack();
+            self.watchdog.clear_pending(signal_count_after_arm);
+            self.recovery_quiet_signal_count = signal_count_after_arm;
+            self.recovery_quiet_polls = 0;
+            tracing::warn!(
+                generation = self.generation,
+                recovered_sequence,
+                signal_count_before_arm = current_signal_count,
+                signal_count_after_arm,
+                "late VTL2 interrupt raced with polling-recovery rearm; restarting quiet period"
+            );
+            return;
+        }
+
+        self.watchdog.clear_pending(signal_count_after_arm);
+        self.recovery_quiet_polls = 0;
+        self.poll_recovery_validation_pending = self.recovery_quiet_counted_as_poll;
+        self.recovery_eq_armed = true;
+
+        tracing::info!(
+            generation = self.generation,
+            recovered_sequence,
+            next_expected_sequence = self.expected_sequence,
+            signal_count = signal_count_after_arm,
+            consecutive_poll_recoveries = self.poll_recovery_consecutive,
+            total_poll_recoveries = self.poll_recovery_total,
+            "VTL2 interrupt canary recovery quiet period completed; EQ rearmed"
+        );
     }
 
     pub(crate) fn rearm_after_report(&mut self) {
@@ -590,6 +896,12 @@ impl InterruptCanary {
     pub(crate) fn disable_monitoring(&mut self) {
         self.rearm_after_report = false;
         self.monitoring_enabled = false;
+        self.recovery_quiet_sequence = None;
+        self.recovery_quiet_polls = 0;
+        self.recovery_arm_request_pending = false;
+        self.poll_recovery_validation_pending = false;
+        self.recovery_eq_armed = false;
+        self.recovery_quiet_counted_as_poll = false;
     }
 
     pub(crate) fn monitoring_enabled(&self) -> bool {
@@ -599,6 +911,13 @@ impl InterruptCanary {
     pub(crate) fn prepare_for_save(&mut self) {
         while self.eq.pop().is_some() {}
         self.rearm_after_report = false;
+        self.recovery_quiet_sequence = None;
+        self.recovery_quiet_polls = 0;
+        self.recovery_arm_request_pending = false;
+        self.poll_recovery_validation_pending = false;
+        self.recovery_eq_armed = false;
+        self.recovery_quiet_counted_as_poll = false;
+        self.poll_recovery_consecutive = 0;
         self.watchdog.clear_pending(self.interrupt.signal_count());
         self.eq.arm();
     }
@@ -2142,6 +2461,48 @@ impl<T: DeviceBacking> GdmaDriver<T> {
 #[cfg(test)]
 mod interrupt_canary_tests {
     use super::*;
+    use gdma_defs::Eqe;
+    use gdma_defs::EqeParams;
+    use user_driver::DmaClient;
+    use user_driver::interrupt::DeviceInterruptSource;
+    use user_driver_emulated_mock::DeviceTestMemory;
+
+    fn new_test_canary() -> (InterruptCanary, MemoryBlock, DeviceInterruptSource) {
+        let mem = DeviceTestMemory::new(8, false, "interrupt_canary_recovery");
+        let dma_client = mem.dma_client();
+        let eq_mem = dma_client.allocate_dma_buffer(PAGE_SIZE).unwrap();
+        let interrupt_source = DeviceInterruptSource::new();
+        let interrupt = interrupt_source.new_target();
+        let canary = InterruptCanary::new(
+            Eq::new_eq(eq_mem.clone(), DoorbellPage::null(), 7),
+            interrupt,
+            ResourceArena::new(),
+            4,
+        );
+        (canary, eq_mem, interrupt_source)
+    }
+
+    fn post_test_eqe(eq_mem: &MemoryBlock, offset: usize, sequence: u32) {
+        let mut data = [0; 12];
+        data[..4].copy_from_slice(&sequence.to_le_bytes());
+        eq_mem.write_obj(
+            offset,
+            &Eqe {
+                data,
+                params: EqeParams::new()
+                    .with_event_type(GDMA_EQE_TEST_EVENT)
+                    .with_owner_count(1),
+            },
+        );
+    }
+
+    fn pending_report(canary: &InterruptCanary) -> InterruptCanaryReport {
+        canary.make_report(
+            canary.expected_sequence,
+            VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS,
+            InterruptCanaryFailure::EqePendingNoInterrupt,
+        )
+    }
 
     #[test]
     fn pending_eqe_is_reported_once() {
@@ -2155,7 +2516,8 @@ mod interrupt_canary_tests {
             watchdog.observe(event, 0, 0),
             Some((
                 InterruptCanaryFailure::EqePendingNoInterrupt,
-                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS
+                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS,
+                0,
             ))
         );
         assert_eq!(watchdog.observe(event, 0, 0), None);
@@ -2196,7 +2558,8 @@ mod interrupt_canary_tests {
             result,
             Some((
                 InterruptCanaryFailure::UnexpectedEqe,
-                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS
+                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS,
+                0,
             ))
         );
     }
@@ -2216,7 +2579,8 @@ mod interrupt_canary_tests {
             result,
             Some((
                 InterruptCanaryFailure::EqePendingAfterInterrupt,
-                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS
+                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS,
+                1,
             ))
         );
     }
@@ -2236,8 +2600,219 @@ mod interrupt_canary_tests {
             result,
             Some((
                 InterruptCanaryFailure::EqePendingAfterInterrupt,
-                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS
+                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS,
+                1,
             ))
         );
+    }
+
+    #[test]
+    fn polling_recovery_consumes_exact_eqe_and_rearms_after_quiet() {
+        let (mut canary, eq_mem, _interrupt_source) = new_test_canary();
+        post_test_eqe(&eq_mem, 0, 1);
+
+        canary.process_control(InterruptCanaryControl::RecoverPending(pending_report(
+            &canary,
+        )));
+
+        assert_eq!(canary.expected_sequence, 2);
+        assert!(canary.eq.peek().is_none());
+        assert_eq!(canary.recovery_quiet_sequence, Some(1));
+        assert_eq!(canary.poll_recovery_consecutive, 1);
+
+        let mut control = None;
+        for _ in 0..VTL2_INTERRUPT_CANARY_RECOVERY_QUIET_POLLS {
+            control = canary.recovery_control();
+        }
+        let control = control.expect("quiet period should request rearm");
+        canary.process_control(control);
+
+        assert_eq!(canary.recovery_quiet_sequence, Some(1));
+        assert!(canary.recovery_eq_armed);
+        assert!(canary.poll_recovery_validation_pending);
+    }
+
+    #[test]
+    fn polling_recovery_does_not_consume_after_late_signal() {
+        let (mut canary, eq_mem, interrupt_source) = new_test_canary();
+        post_test_eqe(&eq_mem, 0, 1);
+        let report = pending_report(&canary);
+        interrupt_source.signal_uncached();
+
+        canary.process_control(InterruptCanaryControl::RecoverPending(report));
+
+        assert_eq!(canary.expected_sequence, 1);
+        assert!(canary.eq.peek().is_some());
+        assert_eq!(canary.recovery_quiet_sequence, None);
+        assert_eq!(canary.poll_recovery_total, 0);
+    }
+
+    #[test]
+    fn late_interrupt_restarts_polling_recovery_quiet_period() {
+        let (mut canary, eq_mem, interrupt_source) = new_test_canary();
+        post_test_eqe(&eq_mem, 0, 1);
+        canary.process_control(InterruptCanaryControl::RecoverPending(pending_report(
+            &canary,
+        )));
+
+        for _ in 0..10 {
+            assert!(canary.recovery_control().is_none());
+        }
+        assert_eq!(canary.recovery_quiet_polls, 10);
+
+        interrupt_source.signal_uncached();
+        assert!(canary.process_interrupt().is_none());
+
+        assert_eq!(canary.recovery_quiet_polls, 0);
+        assert_eq!(canary.recovery_quiet_signal_count, 1);
+        assert!(!canary.recovery_arm_request_pending);
+        assert_eq!(canary.poll_recovery_total, 0);
+        assert_eq!(canary.poll_recovery_consecutive, 0);
+        assert!(!canary.recovery_quiet_counted_as_poll);
+
+        let mut control = None;
+        for _ in 0..VTL2_INTERRUPT_CANARY_RECOVERY_QUIET_POLLS {
+            control = canary.recovery_control();
+        }
+        canary.process_control(control.expect("restarted quiet period should request rearm"));
+        assert!(canary.recovery_eq_armed);
+        assert!(!canary.poll_recovery_validation_pending);
+
+        post_test_eqe(&eq_mem, size_of::<Eqe>(), 2);
+        interrupt_source.signal_uncached();
+        assert!(canary.process_interrupt().is_none());
+        assert_eq!(canary.expected_sequence, 3);
+        assert_eq!(canary.recovery_quiet_sequence, None);
+        assert!(!canary.recovery_eq_armed);
+    }
+
+    #[test]
+    fn late_interrupt_after_rearm_disarms_and_restarts_quiet_period() {
+        let (mut canary, eq_mem, interrupt_source) = new_test_canary();
+        post_test_eqe(&eq_mem, 0, 1);
+        canary.process_control(InterruptCanaryControl::RecoverPending(pending_report(
+            &canary,
+        )));
+
+        let mut control = None;
+        for _ in 0..VTL2_INTERRUPT_CANARY_RECOVERY_QUIET_POLLS {
+            control = canary.recovery_control();
+        }
+        canary.process_control(control.expect("quiet period should request rearm"));
+        assert!(canary.recovery_eq_armed);
+
+        interrupt_source.signal_uncached();
+        assert!(canary.process_interrupt().is_none());
+
+        assert!(!canary.recovery_eq_armed);
+        assert!(!canary.poll_recovery_validation_pending);
+        assert_eq!(canary.recovery_quiet_sequence, Some(1));
+        assert_eq!(canary.recovery_quiet_polls, 0);
+        assert_eq!(canary.recovery_quiet_signal_count, 1);
+        assert_eq!(canary.poll_recovery_total, 0);
+        assert_eq!(canary.poll_recovery_consecutive, 0);
+        assert!(!canary.recovery_quiet_counted_as_poll);
+    }
+
+    #[test]
+    fn hardware_interrupt_after_polling_recovery_resets_miss_streak() {
+        let (mut canary, eq_mem, interrupt_source) = new_test_canary();
+        post_test_eqe(&eq_mem, 0, 1);
+        canary.process_control(InterruptCanaryControl::RecoverPending(pending_report(
+            &canary,
+        )));
+
+        let mut control = None;
+        for _ in 0..VTL2_INTERRUPT_CANARY_RECOVERY_QUIET_POLLS {
+            control = canary.recovery_control();
+        }
+        canary.process_control(control.expect("quiet period should request rearm"));
+
+        post_test_eqe(&eq_mem, size_of::<Eqe>(), 2);
+        interrupt_source.signal_uncached();
+        assert!(canary.process_interrupt().is_none());
+
+        assert_eq!(canary.expected_sequence, 3);
+        assert_eq!(canary.poll_recovery_consecutive, 0);
+        assert!(!canary.poll_recovery_validation_pending);
+        assert_eq!(canary.recovery_quiet_sequence, None);
+        assert!(!canary.recovery_eq_armed);
+    }
+
+    #[test]
+    fn polling_recovery_stops_at_consecutive_limit() {
+        let (mut canary, eq_mem, _interrupt_source) = new_test_canary();
+        post_test_eqe(&eq_mem, 0, 1);
+        canary.poll_recovery_consecutive = VTL2_INTERRUPT_CANARY_MAX_CONSECUTIVE_POLL_RECOVERIES;
+
+        canary.process_control(InterruptCanaryControl::RecoverPending(pending_report(
+            &canary,
+        )));
+
+        assert!(!canary.monitoring_enabled());
+        assert_eq!(canary.expected_sequence, 1);
+        assert!(canary.eq.peek().is_some());
+    }
+
+    #[test]
+    fn disabled_canary_does_not_consume_or_rearm() {
+        let (mut canary, eq_mem, interrupt_source) = new_test_canary();
+        post_test_eqe(&eq_mem, 0, 1);
+        canary.disable_monitoring();
+        interrupt_source.signal_uncached();
+
+        assert!(canary.process_interrupt().is_none());
+        assert_eq!(canary.expected_sequence, 1);
+        assert!(canary.eq.peek().is_some());
+    }
+
+    #[test]
+    fn recovery_limit_does_not_disable_after_late_signal() {
+        let (mut canary, eq_mem, interrupt_source) = new_test_canary();
+        post_test_eqe(&eq_mem, 0, 1);
+        let report = pending_report(&canary);
+        canary.poll_recovery_consecutive = VTL2_INTERRUPT_CANARY_MAX_CONSECUTIVE_POLL_RECOVERIES;
+        interrupt_source.signal_uncached();
+
+        canary.process_control(InterruptCanaryControl::RecoverPending(report));
+
+        assert!(canary.monitoring_enabled());
+        assert_eq!(canary.expected_sequence, 1);
+        assert!(canary.eq.peek().is_some());
+    }
+
+    #[test]
+    fn consecutive_lost_interrupts_each_complete_polling_recovery() {
+        let (mut canary, eq_mem, _interrupt_source) = new_test_canary();
+        post_test_eqe(&eq_mem, 0, 1);
+        canary.process_control(InterruptCanaryControl::RecoverPending(pending_report(
+            &canary,
+        )));
+
+        let mut control = None;
+        for _ in 0..VTL2_INTERRUPT_CANARY_RECOVERY_QUIET_POLLS {
+            control = canary.recovery_control();
+        }
+        canary.process_control(control.expect("first quiet period should request rearm"));
+        assert!(canary.recovery_eq_armed);
+
+        post_test_eqe(&eq_mem, size_of::<Eqe>(), 2);
+        canary.process_control(InterruptCanaryControl::RecoverPending(pending_report(
+            &canary,
+        )));
+
+        assert!(!canary.recovery_eq_armed);
+        assert_eq!(canary.recovery_quiet_sequence, Some(2));
+        assert_eq!(canary.poll_recovery_consecutive, 2);
+
+        control = None;
+        for _ in 0..VTL2_INTERRUPT_CANARY_RECOVERY_QUIET_POLLS {
+            control = canary.recovery_control();
+        }
+        canary.process_control(control.expect("second quiet period should request rearm"));
+
+        assert!(canary.recovery_eq_armed);
+        assert!(canary.poll_recovery_validation_pending);
+        assert_eq!(canary.expected_sequence, 3);
     }
 }
