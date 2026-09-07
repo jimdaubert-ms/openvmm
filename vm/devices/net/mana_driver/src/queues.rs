@@ -225,8 +225,8 @@ impl<T: IntoBytes + FromBytes + Immutable + KnownLayout> CqEq<T> {
             .read_obj((self.next.wrapping_add(offset) & (self.size - 1)) as usize)
     }
 
-    /// Pops an event queue entry.
-    pub fn pop(&mut self) -> Option<T> {
+    /// Returns the next queue entry without advancing the consumer.
+    pub fn peek(&self) -> Option<T> {
         // Perform an acquire load to ensure that the read of the queue entry is
         // not reordered before the read of the owner count.
         let b = self.mem.as_slice()
@@ -237,13 +237,18 @@ impl<T: IntoBytes + FromBytes + Immutable + KnownLayout> CqEq<T> {
         if owner_count == (cur_owner_count.wrapping_sub(1)) & OWNER_MASK as u8 {
             None
         } else if owner_count == cur_owner_count & OWNER_MASK as u8 {
-            let qe = self.read_next::<T>(0);
-            self.next = self.next.wrapping_add(size_of_val(&qe) as u32);
-            Some(qe)
+            Some(self.read_next::<T>(0))
         } else {
             tracing::error!(next = self.next, owner_count, queue_type = ?self.queue_type, id = self.id, "eq/cq wrapped");
             None
         }
+    }
+
+    /// Pops an event queue entry.
+    pub fn pop(&mut self) -> Option<T> {
+        let qe = self.peek()?;
+        self.next = self.next.wrapping_add(size_of_val(&qe) as u32);
+        Some(qe)
     }
 
     fn flush(&mut self, arm: bool) {
@@ -268,7 +273,7 @@ impl<T: IntoBytes + FromBytes + Immutable + KnownLayout> CqEq<T> {
     }
 
     /// Reports next value for diagnostics
-    pub fn get_next(&mut self) -> u32 {
+    pub fn get_next(&self) -> u32 {
         self.next
     }
 }

@@ -10,6 +10,7 @@ pub use crate::save_restore::ManaDeviceSavedState;
 use crate::bnic_driver::BnicDriver;
 use crate::bnic_driver::WqConfig;
 use crate::gdma_driver::GdmaDriver;
+use crate::gdma_driver::InterruptCanary;
 use crate::queues;
 use crate::queues::Doorbell;
 use crate::queues::DoorbellPage;
@@ -30,7 +31,9 @@ use net_backend_resources::mac_address::MacAddress;
 use pal_async::driver::SpawnDriver;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
+use pal_async::timer::PolledTimer;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::Instrument;
 use user_driver::DeviceBacking;
 use user_driver::DmaClient;
@@ -58,6 +61,10 @@ pub struct ManaDevice<T: DeviceBacking> {
     inspect_task: Task<()>,
     #[inspect(skip)]
     hwc_task: Option<Task<()>>,
+    #[inspect(skip)]
+    interrupt_canary_task: Option<Task<()>>,
+    #[inspect(skip)]
+    interrupt_canary_watchdog_task: Option<Task<()>>,
     #[inspect(flatten, send = "|x| x")]
     inspect_send: mesh::Sender<inspect::Deferred>,
 }
@@ -70,6 +77,7 @@ struct Inner<T: DeviceBacking> {
     doorbell: Arc<dyn Doorbell>,
     vport_link_status: Arc<Mutex<Vec<LinkStatus>>>,
     vf_reset_request_sender: Arc<Mutex<Option<mesh::Sender<bool>>>>,
+    interrupt_canary: Mutex<Option<InterruptCanary>>,
 }
 
 impl<T: DeviceBacking> ManaDevice<T> {
@@ -94,7 +102,7 @@ impl<T: DeviceBacking> ManaDevice<T> {
                 })?
                 .clone();
 
-            GdmaDriver::restore(mana_state.gdma.clone(), device, gdma_memory)
+            GdmaDriver::restore(driver, mana_state.gdma.clone(), device, gdma_memory)
                 .instrument(tracing::info_span!("restore_gdma_driver"))
                 .await?
         } else {
@@ -106,6 +114,30 @@ impl<T: DeviceBacking> ManaDevice<T> {
         gdma.test_eq().await?;
 
         gdma.verify_vf_driver_version().await?;
+
+        let mut interrupt_canary = match gdma
+            .initialize_interrupt_canary(
+                mana_state.and_then(|state| state.interrupt_canary.as_ref()),
+            )
+            .await
+        {
+            Ok(canary) => canary,
+            Err(error) => {
+                tracing::warn!(
+                    error = error.as_ref() as &dyn std::error::Error,
+                    "failed to initialize optional VTL2 interrupt canary"
+                );
+                None
+            }
+        };
+        if !gdma.interrupt_canary_supported()
+            && let Some(canary) = interrupt_canary.take()
+        {
+            tracing::info!(
+                "discarding restored VTL2 interrupt canary because the PF no longer supports it"
+            );
+            canary.into_resources().destroy(&mut gdma).await;
+        }
 
         let dev_id = gdma
             .list_devices()
@@ -143,6 +175,7 @@ impl<T: DeviceBacking> ManaDevice<T> {
             doorbell,
             vport_link_status: Arc::new(Mutex::new(vport_link_status)),
             vf_reset_request_sender: Arc::new(Mutex::new(None)),
+            interrupt_canary: Mutex::new(interrupt_canary),
         });
 
         let (inspect_send, mut inspect_recv) = mesh::channel::<inspect::Deferred>();
@@ -158,6 +191,7 @@ impl<T: DeviceBacking> ManaDevice<T> {
                         doorbell: _,
                         vport_link_status: _,
                         vf_reset_request_sender: _,
+                        interrupt_canary: _,
                     } = inner.as_ref();
                     let gdma = gdma.lock().await;
                     deferred.respond(|resp| {
@@ -172,26 +206,74 @@ impl<T: DeviceBacking> ManaDevice<T> {
             inspect_send,
             inspect_task,
             hwc_task: None,
+            interrupt_canary_task: None,
+            interrupt_canary_watchdog_task: None,
         };
         Ok(device)
     }
 
     /// Saves the device's state for servicing
     pub async fn save(self) -> (anyhow::Result<ManaDeviceSavedState>, T) {
+        let canary_disable = self
+            .inner
+            .interrupt_canary
+            .lock()
+            .await
+            .as_ref()
+            .map(|canary| canary.registration(false));
+        let canary_disable_result = match canary_disable {
+            Some(request) => {
+                self.inner
+                    .gdma
+                    .lock()
+                    .await
+                    .configure_interrupt_canary(request)
+                    .await
+            }
+            None => Ok(()),
+        };
+
         self.inspect_task.cancel().await;
         if let Some(hwc_task) = self.hwc_task {
             hwc_task.cancel().await;
         }
+        if let Some(task) = self.interrupt_canary_task {
+            task.cancel().await;
+        }
+        if let Some(task) = self.interrupt_canary_watchdog_task {
+            task.cancel().await;
+        }
 
         let inner = Arc::into_inner(self.inner)
             .expect("MANA device save failed, multiple references remain.");
+        let mut interrupt_canary = inner.interrupt_canary.into_inner();
+        if let Some(canary) = interrupt_canary.as_mut() {
+            canary.prepare_for_save();
+        }
         let mut driver = inner.gdma.into_inner();
 
+        if let Err(error) = canary_disable_result {
+            if let Some(canary) = interrupt_canary {
+                canary.quarantine();
+            }
+            driver.mark_hwc_failure();
+            return (
+                Err(error).context("failed to disable VTL2 interrupt canary before save"),
+                driver.into_device(),
+            );
+        }
+
         if let Ok(saved_state) = driver.save().await {
-            let mana_saved_state = ManaDeviceSavedState { gdma: saved_state };
+            let mana_saved_state = ManaDeviceSavedState {
+                gdma: saved_state,
+                interrupt_canary: interrupt_canary.map(InterruptCanary::save),
+            };
 
             (Ok(mana_saved_state), driver.into_device())
         } else {
+            if let Some(canary) = interrupt_canary {
+                canary.into_resources().destroy(&mut driver).await;
+            }
             tracing::error!("Failed to save MANA device state");
             (
                 Err(anyhow::anyhow!("Failed to save MANA device state")),
@@ -258,6 +340,134 @@ impl<T: DeviceBacking> ManaDevice<T> {
             }
         });
         self.hwc_task = Some(hwc_task);
+
+        if !self.inner.gdma.lock().await.interrupt_canary_supported() {
+            return;
+        }
+
+        let canary_interrupt = {
+            let mut canary = self.inner.interrupt_canary.lock().await;
+            canary.as_mut().map(|canary| {
+                canary.prepare_registration();
+                canary.interrupt()
+            })
+        };
+        if let Some(mut interrupt) = canary_interrupt {
+            let inner = self.inner.clone();
+            let timer_driver = driver_source.simple();
+            let mut report_timer = PolledTimer::new(&timer_driver);
+            self.interrupt_canary_task = Some(driver_source.simple().spawn(
+                "mana-interrupt-canary",
+                async move {
+                    loop {
+                        interrupt.wait().await;
+                        let report = {
+                            let mut canary = inner.interrupt_canary.lock().await;
+                            canary.as_mut().and_then(InterruptCanary::process_interrupt)
+                        };
+                        if let Some(report) = report {
+                            let report_deadline = std::time::Instant::now()
+                                + Duration::from_millis(
+                                    crate::gdma_driver::
+                                        VTL2_INTERRUPT_CANARY_REPORT_RETRY_TIMEOUT_MS,
+                                );
+                            let acknowledged = loop {
+                                if inner
+                                    .gdma
+                                    .lock()
+                                    .await
+                                    .report_interrupt_canary(report)
+                                    .await
+                                {
+                                    break true;
+                                }
+                                if std::time::Instant::now() >= report_deadline {
+                                    break false;
+                                }
+                                report_timer
+                                    .sleep(Duration::from_millis(
+                                        crate::gdma_driver::
+                                            VTL2_INTERRUPT_CANARY_REPORT_RETRY_INTERVAL_MS,
+                                    ))
+                                    .await;
+                            };
+                            if !acknowledged {
+                                tracing::error!(
+                                    "VTL2 interrupt canary report retry deadline expired; \
+                                     leaving the EQ disarmed and disabling the canary without \
+                                     failing the MANA control plane"
+                                );
+                                if let Some(canary) = inner.interrupt_canary.lock().await.as_mut() {
+                                    canary.disable_monitoring();
+                                }
+                                break;
+                            }
+                            if let Some(canary) = inner.interrupt_canary.lock().await.as_mut() {
+                                canary.rearm_after_report();
+                            }
+                        }
+                    }
+                },
+            ));
+
+            let inner = self.inner.clone();
+            let timer_driver = driver_source.simple();
+            let mut timer = PolledTimer::new(&timer_driver);
+            self.interrupt_canary_watchdog_task = Some(driver_source.simple().spawn(
+                "mana-interrupt-canary-watchdog",
+                async move {
+                    loop {
+                        timer
+                            .sleep(Duration::from_millis(
+                                crate::gdma_driver::VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS as u64,
+                            ))
+                            .await;
+                        let report = {
+                            let Some(mut canary) = inner.interrupt_canary.try_lock() else {
+                                continue;
+                            };
+                            let Some(canary) = canary.as_mut() else {
+                                break;
+                            };
+                            if !canary.monitoring_enabled() {
+                                break;
+                            }
+                            canary.observe()
+                        };
+                        if let Some(report) = report {
+                            inner
+                                .gdma
+                                .lock()
+                                .await
+                                .report_interrupt_canary(report)
+                                .await;
+                        }
+                    }
+                },
+            ));
+
+            let registration = self
+                .inner
+                .interrupt_canary
+                .lock()
+                .await
+                .as_ref()
+                .map(|canary| canary.registration(true));
+            if let Some(registration) = registration
+                && let Err(error) = self
+                    .inner
+                    .gdma
+                    .lock()
+                    .await
+                    .configure_interrupt_canary(registration)
+                    .await
+            {
+                tracing::error!(
+                    error = error.as_ref() as &dyn std::error::Error,
+                    "failed to enable VTL2 interrupt canary"
+                );
+            }
+        }
     }
 
     /// Initializes and returns the vport number `index`.
@@ -310,13 +520,52 @@ impl<T: DeviceBacking> ManaDevice<T> {
 
     /// Shuts the device down.
     pub async fn shutdown(self) -> (anyhow::Result<()>, T) {
+        let canary_disable = self
+            .inner
+            .interrupt_canary
+            .lock()
+            .await
+            .as_ref()
+            .map(|canary| canary.registration(false));
+        let canary_disable_result = match canary_disable {
+            Some(request) => {
+                self.inner
+                    .gdma
+                    .lock()
+                    .await
+                    .configure_interrupt_canary(request)
+                    .await
+            }
+            None => Ok(()),
+        };
+
         self.inspect_task.cancel().await;
         if let Some(hwc_task) = self.hwc_task {
             hwc_task.cancel().await;
         }
+        if let Some(task) = self.interrupt_canary_task {
+            task.cancel().await;
+        }
+        if let Some(task) = self.interrupt_canary_watchdog_task {
+            task.cancel().await;
+        }
         let inner = Arc::into_inner(self.inner)
             .expect("MANA device shutdown failed, multiple references remain.");
         let mut driver = inner.gdma.into_inner();
+        let interrupt_canary = inner.interrupt_canary.into_inner();
+        if let Err(error) = canary_disable_result {
+            if let Some(canary) = interrupt_canary {
+                canary.quarantine();
+            }
+            driver.mark_hwc_failure();
+            return (
+                Err(error).context("failed to disable VTL2 interrupt canary before shutdown"),
+                driver.into_device(),
+            );
+        }
+        if let Some(canary) = interrupt_canary {
+            canary.into_resources().destroy(&mut driver).await;
+        }
         let result = driver.deregister_device(inner.dev_id).await;
         (result, driver.into_device())
     }

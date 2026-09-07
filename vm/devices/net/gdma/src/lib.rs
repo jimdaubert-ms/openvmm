@@ -29,9 +29,13 @@ use gdma_defs::DB_RQ_CLIENT_DATA;
 use gdma_defs::DB_SQ;
 use gdma_defs::PAGE_SIZE64;
 use gdma_defs::RegMap;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_PENDING_MS_MASK;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_SHIFT;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_VALID;
 use gdma_defs::SMC_MSG_TYPE_DESTROY_HWC_VERSION;
 use gdma_defs::SMC_MSG_TYPE_ESTABLISH_HWC_VERSION;
 use gdma_defs::SMC_MSG_TYPE_REPORT_HWC_TIMEOUT_VERSION;
+use gdma_defs::SMC_MSG_TYPE_REPORT_VTL2_INTERRUPT_CANARY_VERSION;
 use gdma_defs::SmcMessageType;
 use gdma_defs::SmcProtoHdr;
 use gdma_defs::WqDoorbellValue;
@@ -302,11 +306,28 @@ impl GdmaDevice {
                 if hdr.msg_version() < SMC_MSG_TYPE_REPORT_HWC_TIMEOUT_VERSION {
                     return Err(SmcError::UnsupportedVersion);
                 }
+                let flags = self.shmem.0[6];
+                if hdr.msg_version() >= SMC_MSG_TYPE_REPORT_VTL2_INTERRUPT_CANARY_VERSION
+                    && flags & SMC_GDMA_VTL2_INTERRUPT_CANARY_VALID != 0
+                {
+                    tracing::error!(
+                        generation = self.shmem.0[0],
+                        expected_sequence = self.shmem.0[1],
+                        observed_sequence = self.shmem.0[2],
+                        queue_id = self.shmem.0[3],
+                        eq_next = self.shmem.0[4],
+                        interrupt_count = self.shmem.0[5],
+                        pending_ms = flags & SMC_GDMA_VTL2_INTERRUPT_CANARY_PENDING_MS_MASK,
+                        result = (flags >> SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_SHIFT) & 0x7,
+                        "report_vtl2_interrupt_canary"
+                    );
+                    return Ok(true);
+                }
                 let rqt = self.shmem.0[0];
                 let sqt = self.shmem.0[1];
                 let cqn = self.shmem.0[2];
                 let eqn = self.shmem.0[3];
-                let flags_wait = self.shmem.0[6];
+                let flags_wait = flags;
                 let wait_time_mask = 0xff_ffff;
                 let wait_time = flags_wait & wait_time_mask;
                 let cmd_failed_mask = 0x01_u32;

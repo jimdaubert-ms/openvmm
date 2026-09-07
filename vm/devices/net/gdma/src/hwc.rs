@@ -7,12 +7,15 @@ use crate::queues::QueueAllocError;
 use crate::queues::Queues;
 use anyhow::Context;
 use anyhow::anyhow;
+use gdma_defs::DRIVER_CAP_FLAG_1_VTL2_INTERRUPT_CANARY;
 use gdma_defs::GDMA_EQE_HWC_INIT_DATA;
 use gdma_defs::GDMA_EQE_HWC_INIT_DONE;
 use gdma_defs::GDMA_EQE_HWC_INIT_EQ_ID_DB;
 use gdma_defs::GDMA_EQE_HWC_RESET_REQUEST;
 use gdma_defs::GDMA_EQE_TEST_EVENT;
+use gdma_defs::GDMA_PF_CAP_FLAG_2_VTL2_INTERRUPT_CANARY;
 use gdma_defs::GdmaChangeMsixVectorIndexForEq;
+use gdma_defs::GdmaConfigureVtl2InterruptCanaryReq;
 use gdma_defs::GdmaCreateDmaRegionReq;
 use gdma_defs::GdmaCreateDmaRegionResp;
 use gdma_defs::GdmaCreateQueueReq;
@@ -357,7 +360,14 @@ impl HwControl {
                 let resp = GdmaVerifyVerResp {
                     gdma_protocol_ver: req.protocol_ver_min,
                     pf_cap_flags1: 0,
-                    pf_cap_flags2: 0,
+                    pf_cap_flags2: if req.gd_drv_cap_flags1
+                        & DRIVER_CAP_FLAG_1_VTL2_INTERRUPT_CANARY
+                        != 0
+                    {
+                        GDMA_PF_CAP_FLAG_2_VTL2_INTERRUPT_CANARY
+                    } else {
+                        0
+                    },
                     pf_cap_flags3: 0,
                     pf_cap_flags4: 0,
                 };
@@ -487,6 +497,22 @@ impl HwControl {
                 self.state
                     .queues
                     .update_eq_msix(req.queue_index, req.msix)?;
+                0
+            }
+            GdmaRequestType::GDMA_CONFIGURE_VTL2_INTERRUPT_CANARY => {
+                let req: GdmaConfigureVtl2InterruptCanaryReq = read
+                    .read_plain()
+                    .context("failed to read interrupt canary request")?;
+                if req.enable > 1 || req.reserved != 0 {
+                    anyhow::bail!("invalid interrupt canary request");
+                }
+                if req.enable != 0 {
+                    self.state.queues.post_eq(
+                        req.queue_index,
+                        GDMA_EQE_TEST_EVENT,
+                        &1_u32.to_le_bytes(),
+                    );
+                }
                 0
             }
             GdmaRequestType::GDMA_DEREGISTER_DEVICE => {

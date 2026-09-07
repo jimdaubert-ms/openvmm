@@ -25,6 +25,23 @@ pub struct ManaDeviceSavedState {
     /// Saved state for restoration of the GDMA driver
     #[mesh(1)]
     pub gdma: GdmaDriverSavedState,
+
+    /// Saved state for the dedicated interrupt canary, if supported
+    #[mesh(2)]
+    pub interrupt_canary: Option<InterruptCanarySavedState>,
+}
+
+/// Saved state for the dedicated VTL2 interrupt canary.
+#[derive(Debug, Protobuf, Clone)]
+#[mesh(package = "mana_driver")]
+pub struct InterruptCanarySavedState {
+    /// EQ state preserved across servicing
+    #[mesh(1)]
+    pub eq: CqEqSavedState,
+
+    /// Dedicated MSI-X vector assigned to the canary
+    #[mesh(2)]
+    pub msix: u32,
 }
 
 /// Top level saved state for the GDMA driver's saved state
@@ -77,6 +94,10 @@ pub struct GdmaDriverSavedState {
     /// Link status by vport index
     #[mesh(12)]
     pub link_toggle: Vec<(u32, bool)>,
+
+    /// Maximum MSI-X vectors reported by the PF and device
+    #[mesh(13)]
+    pub max_msix_available: u32,
 }
 
 /// The saved state of a completion queue or event queue for restoration

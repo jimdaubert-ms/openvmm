@@ -11,6 +11,7 @@ use crate::resources::Resource;
 use crate::resources::ResourceArena;
 use crate::save_restore::DoorbellSavedState;
 use crate::save_restore::GdmaDriverSavedState;
+use crate::save_restore::InterruptCanarySavedState;
 use crate::save_restore::SavedMemoryState;
 use anyhow::Context;
 use futures::FutureExt;
@@ -19,6 +20,7 @@ use gdma_defs::DRIVER_CAP_FLAG_1_HW_VPORT_LINK_AWARE;
 use gdma_defs::DRIVER_CAP_FLAG_1_HWC_TIMEOUT_RECONFIG;
 use gdma_defs::DRIVER_CAP_FLAG_1_SELF_RESET_ON_EQE_NOTIFICATION;
 use gdma_defs::DRIVER_CAP_FLAG_1_VARIABLE_INDIRECTION_TABLE_SUPPORT;
+use gdma_defs::DRIVER_CAP_FLAG_1_VTL2_INTERRUPT_CANARY;
 use gdma_defs::DRIVER_CAP_FLAG_1_VTL2_REVOKE_SUB_ON_RESET_EQE;
 use gdma_defs::DRIVER_CAP_FLAG_1_VTL2_SELECTIVE_REVOKE_SUB_ON_RESET_EQE;
 use gdma_defs::EqeDataReconfig;
@@ -33,8 +35,10 @@ use gdma_defs::GDMA_EQE_HWC_RESET_REQUEST;
 use gdma_defs::GDMA_EQE_TEST_EVENT;
 use gdma_defs::GDMA_MESSAGE_V1;
 use gdma_defs::GDMA_PAGE_TYPE_4K;
+use gdma_defs::GDMA_PF_CAP_FLAG_2_VTL2_INTERRUPT_CANARY;
 use gdma_defs::GDMA_STANDARD_HEADER_TYPE;
 use gdma_defs::GdmaChangeMsixVectorIndexForEq;
+use gdma_defs::GdmaConfigureVtl2InterruptCanaryReq;
 use gdma_defs::GdmaCreateDmaRegionReq;
 use gdma_defs::GdmaCreateDmaRegionResp;
 use gdma_defs::GdmaCreateQueueReq;
@@ -70,14 +74,25 @@ use gdma_defs::HwcTxOob;
 use gdma_defs::HwcTxOobFlags3;
 use gdma_defs::HwcTxOobFlags4;
 use gdma_defs::RegMap;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_LEGACY_PROBE;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_PENDING_MS_MASK;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_EQE_PENDING_AFTER_INTERRUPT;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_EQE_PENDING_NO_INTERRUPT;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_INTERRUPT_NO_EQE;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_SEQUENCE_MISMATCH;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_SHIFT;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_UNEXPECTED_EQE;
+use gdma_defs::SMC_GDMA_VTL2_INTERRUPT_CANARY_VALID;
 use gdma_defs::SMC_MSG_TYPE_DESTROY_HWC_VERSION;
 use gdma_defs::SMC_MSG_TYPE_ESTABLISH_HWC_VERSION;
 use gdma_defs::SMC_MSG_TYPE_REPORT_HWC_TIMEOUT_VERSION;
+use gdma_defs::SMC_MSG_TYPE_REPORT_VTL2_INTERRUPT_CANARY_VERSION;
 use gdma_defs::Sge;
 use gdma_defs::SmcMessageType;
 use gdma_defs::SmcProtoHdr;
 use inspect::Inspect;
 use pal_async::driver::Driver;
+use pal_async::timer::PolledTimer;
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
@@ -102,6 +117,15 @@ const HWC_TIMEOUT_FOR_SHUTDOWN_IN_MS: u32 = 100;
 const HWC_POLL_TIMEOUT_IN_MS: u64 = 10000;
 const HWC_INTERRUPT_POLL_WAIT_MIN_MS: u32 = 20;
 const HWC_INTERRUPT_POLL_WAIT_MAX_MS: u32 = 500;
+pub(crate) const VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS: u32 = 10;
+const VTL2_INTERRUPT_CANARY_MIN_DELAY_MS: u32 = 250;
+const VTL2_INTERRUPT_CANARY_MAX_DELAY_MS: u32 = 750;
+const VTL2_INTERRUPT_CANARY_COMPLETION_TIMEOUT_MS: u32 = 500;
+const VTL2_INTERRUPT_CANARY_PENDING_POLLS: u32 = 25;
+const VTL2_INTERRUPT_CANARY_SHMEM_TIMEOUT_MS: u64 = 100;
+const VTL2_INTERRUPT_CANARY_SHMEM_POLL_MS: u64 = 1;
+pub(crate) const VTL2_INTERRUPT_CANARY_REPORT_RETRY_INTERVAL_MS: u64 = 500;
+pub(crate) const VTL2_INTERRUPT_CANARY_REPORT_RETRY_TIMEOUT_MS: u64 = 30000;
 
 #[derive(Inspect)]
 struct Bar0<T: Inspect> {
@@ -142,6 +166,8 @@ pub struct GdmaDriver<T: DeviceBacking> {
     device: Option<T>,
     bar0: Arc<Bar0<T::Registers>>,
     #[inspect(skip)]
+    shmem_poll_timer: PolledTimer,
+    #[inspect(skip)]
     dma_buffer: MemoryBlock,
     #[inspect(skip)]
     interrupts: Vec<Option<DeviceInterrupt>>,
@@ -157,6 +183,7 @@ pub struct GdmaDriver<T: DeviceBacking> {
     #[inspect(iter_by_key)]
     eq_id_msix: HashMap<u32, u32>,
     num_msix: u32,
+    max_msix_available: u32,
     min_queue_avail: u32,
     hwc_activity_id: u32,
     #[inspect(skip)]
@@ -165,6 +192,8 @@ pub struct GdmaDriver<T: DeviceBacking> {
     hwc_warning_time_in_ms: u32,
     hwc_timeout_in_ms: u32,
     hwc_failure: bool,
+    vtl2_interrupt_canary_supported: bool,
+    vtl2_interrupt_canary_reserved: bool,
     db_id: u32,
     state_saved: bool,
     // The option will be set if there is a pending VF reset event. The
@@ -178,7 +207,8 @@ const RQ_PAGE: usize = 2;
 const SQ_PAGE: usize = 3;
 const REQUEST_PAGE: usize = 4;
 const RESPONSE_PAGE: usize = 5;
-const NUM_PAGES: usize = 6;
+const VTL2_INTERRUPT_CANARY_EQ_PAGE: usize = 6;
+const NUM_PAGES: usize = 7;
 
 // RWQEs have no OOB and one SGL entry so they are always exactly 32 bytes.
 const RWQE_SIZE: u32 = 32;
@@ -276,6 +306,319 @@ struct EqeWaitResult {
     interrupt_wait_count: u32,
     interrupt_count: u32,
     last_wait_result: anyhow::Result<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptCanaryFailure {
+    EqePendingNoInterrupt,
+    EqePendingAfterInterrupt,
+    InterruptWithoutEqe,
+    UnexpectedEqe,
+    SequenceMismatch,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InterruptCanaryReport {
+    pub generation: u32,
+    pub expected_sequence: u32,
+    pub observed_sequence: u32,
+    pub queue_id: u32,
+    pub eq_next: u32,
+    pub interrupt_count: u32,
+    pub poll_count: u32,
+    pub pending_ms: u32,
+    pub failure: InterruptCanaryFailure,
+}
+
+#[derive(Default)]
+struct InterruptCanaryWatchdog {
+    pending_event: Option<(u8, u32)>,
+    pending_polls: u32,
+    last_reported_event: Option<(u8, u32)>,
+    poll_count: u32,
+    idle_interrupt_signal_count: u64,
+    pending_interrupt_signal_seen: bool,
+}
+
+impl InterruptCanaryWatchdog {
+    fn clear_pending(&mut self, interrupt_signal_count: u64) {
+        self.pending_event = None;
+        self.pending_polls = 0;
+        self.last_reported_event = None;
+        self.idle_interrupt_signal_count = interrupt_signal_count;
+        self.pending_interrupt_signal_seen = false;
+    }
+
+    fn observe(
+        &mut self,
+        event: Option<(u8, u32)>,
+        interrupt_signal_count_before: u64,
+        interrupt_signal_count_after: u64,
+    ) -> Option<(InterruptCanaryFailure, u32)> {
+        self.poll_count = self.poll_count.saturating_add(1);
+
+        let Some(event) = event else {
+            self.pending_event = None;
+            self.pending_polls = 0;
+            self.last_reported_event = None;
+            self.pending_interrupt_signal_seen = false;
+            if interrupt_signal_count_before == interrupt_signal_count_after {
+                self.idle_interrupt_signal_count = interrupt_signal_count_after;
+            }
+            return None;
+        };
+
+        if self.pending_event == Some(event) {
+            self.pending_polls = self.pending_polls.saturating_add(1);
+            self.pending_interrupt_signal_seen |= interrupt_signal_count_before
+                > self.idle_interrupt_signal_count
+                || interrupt_signal_count_after > self.idle_interrupt_signal_count;
+        } else {
+            self.pending_event = Some(event);
+            self.pending_polls = 1;
+            self.pending_interrupt_signal_seen = interrupt_signal_count_before
+                > self.idle_interrupt_signal_count
+                || interrupt_signal_count_after > self.idle_interrupt_signal_count;
+        }
+
+        if self.pending_polls < VTL2_INTERRUPT_CANARY_PENDING_POLLS
+            || self.last_reported_event == Some(event)
+        {
+            return None;
+        }
+
+        self.last_reported_event = Some(event);
+        let failure = if event.0 == GDMA_EQE_TEST_EVENT {
+            if self.pending_interrupt_signal_seen {
+                InterruptCanaryFailure::EqePendingAfterInterrupt
+            } else {
+                InterruptCanaryFailure::EqePendingNoInterrupt
+            }
+        } else {
+            InterruptCanaryFailure::UnexpectedEqe
+        };
+        Some((
+            failure,
+            self.pending_polls
+                .saturating_mul(VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS),
+        ))
+    }
+}
+
+pub(crate) struct InterruptCanary {
+    eq: Eq,
+    interrupt: DeviceInterrupt,
+    resources: ResourceArena,
+    msix: u32,
+    generation: u32,
+    expected_sequence: u32,
+    interrupt_count: u32,
+    watchdog: InterruptCanaryWatchdog,
+    rearm_after_report: bool,
+    monitoring_enabled: bool,
+}
+
+impl InterruptCanary {
+    fn new(eq: Eq, interrupt: DeviceInterrupt, resources: ResourceArena, msix: u32) -> Self {
+        let mut generation_bytes = [0_u8; 4];
+        getrandom::fill(&mut generation_bytes).unwrap();
+        let mut generation = u32::from_ne_bytes(generation_bytes);
+        if generation == 0 {
+            generation = 1;
+        }
+
+        let mut watchdog = InterruptCanaryWatchdog::default();
+        watchdog.clear_pending(interrupt.signal_count());
+        Self {
+            eq,
+            interrupt,
+            resources,
+            msix,
+            generation,
+            expected_sequence: 1,
+            interrupt_count: 0,
+            watchdog,
+            rearm_after_report: false,
+            monitoring_enabled: true,
+        }
+    }
+
+    fn restore(eq: Eq, interrupt: DeviceInterrupt, resources: ResourceArena, msix: u32) -> Self {
+        Self::new(eq, interrupt, resources, msix)
+    }
+
+    pub(crate) fn interrupt(&self) -> DeviceInterrupt {
+        self.interrupt.clone()
+    }
+
+    pub(crate) fn prepare_registration(&mut self) {
+        self.watchdog.clear_pending(self.interrupt.signal_count());
+        self.eq.arm();
+    }
+
+    pub(crate) fn registration(&self, enable: bool) -> GdmaConfigureVtl2InterruptCanaryReq {
+        GdmaConfigureVtl2InterruptCanaryReq {
+            queue_index: self.eq.id(),
+            enable: enable as u32,
+            poll_interval_ms: VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS,
+            min_delay_ms: VTL2_INTERRUPT_CANARY_MIN_DELAY_MS,
+            max_delay_ms: VTL2_INTERRUPT_CANARY_MAX_DELAY_MS,
+            completion_timeout_ms: VTL2_INTERRUPT_CANARY_COMPLETION_TIMEOUT_MS,
+            generation: self.generation,
+            reserved: 0,
+        }
+    }
+
+    fn make_report(
+        &self,
+        observed_sequence: u32,
+        pending_ms: u32,
+        failure: InterruptCanaryFailure,
+    ) -> InterruptCanaryReport {
+        InterruptCanaryReport {
+            generation: self.generation,
+            expected_sequence: self.expected_sequence,
+            observed_sequence,
+            queue_id: self.eq.id(),
+            eq_next: self.eq.get_next(),
+            interrupt_count: self.interrupt.signal_count().try_into().unwrap_or(u32::MAX),
+            poll_count: self.watchdog.poll_count,
+            pending_ms,
+            failure,
+        }
+    }
+
+    pub(crate) fn process_interrupt(&mut self) -> Option<InterruptCanaryReport> {
+        self.interrupt_count = self.interrupt_count.saturating_add(1);
+        let mut event_found = false;
+        let mut expected_event_found = false;
+        let mut failure = None;
+
+        while let Some(eqe) = self.eq.pop() {
+            event_found = true;
+            let observed_sequence =
+                u32::from_le_bytes(eqe.data[..4].try_into().expect("known size"));
+            if eqe.params.event_type() != GDMA_EQE_TEST_EVENT {
+                tracing::error!(
+                    event_type = eqe.params.event_type(),
+                    observed_sequence,
+                    "unexpected VTL2 interrupt canary EQE"
+                );
+                failure = Some(self.make_report(
+                    observed_sequence,
+                    0,
+                    InterruptCanaryFailure::UnexpectedEqe,
+                ));
+            } else if observed_sequence != self.expected_sequence || expected_event_found {
+                tracing::error!(
+                    expected_sequence = self.expected_sequence,
+                    observed_sequence,
+                    "mismatched VTL2 interrupt canary sequence"
+                );
+                failure = Some(self.make_report(
+                    observed_sequence,
+                    0,
+                    InterruptCanaryFailure::SequenceMismatch,
+                ));
+            } else {
+                expected_event_found = true;
+                tracing::trace!(
+                    sequence = observed_sequence,
+                    interrupt_count = self.interrupt_count,
+                    "processed VTL2 interrupt canary EQE"
+                );
+            }
+        }
+
+        if event_found {
+            self.watchdog.clear_pending(self.interrupt.signal_count());
+            if failure.is_none() && expected_event_found {
+                self.expected_sequence = self.expected_sequence.wrapping_add(1);
+                if self.expected_sequence == 0 {
+                    self.expected_sequence = 1;
+                }
+                self.eq.arm();
+            } else {
+                self.rearm_after_report = true;
+            }
+        } else {
+            failure = Some(self.make_report(0, 0, InterruptCanaryFailure::InterruptWithoutEqe));
+            self.rearm_after_report = true;
+        }
+
+        failure
+    }
+
+    pub(crate) fn observe(&mut self) -> Option<InterruptCanaryReport> {
+        let interrupt_signal_count_before = self.interrupt.signal_count();
+        let event = self.eq.peek().map(|eqe| {
+            (
+                eqe.params.event_type(),
+                u32::from_le_bytes(eqe.data[..4].try_into().expect("known size")),
+            )
+        });
+        let interrupt_signal_count_after = self.interrupt.signal_count();
+        let expected_sequence = self.expected_sequence;
+        self.watchdog
+            .observe(
+                event,
+                interrupt_signal_count_before,
+                interrupt_signal_count_after,
+            )
+            .map(|(failure, pending_ms)| {
+                let observed_sequence = event.map_or(0, |(_, sequence)| sequence);
+                let failure = match failure {
+                    InterruptCanaryFailure::EqePendingNoInterrupt
+                    | InterruptCanaryFailure::EqePendingAfterInterrupt
+                        if observed_sequence != expected_sequence =>
+                    {
+                        InterruptCanaryFailure::SequenceMismatch
+                    }
+                    other => other,
+                };
+                self.make_report(observed_sequence, pending_ms, failure)
+            })
+    }
+
+    pub(crate) fn rearm_after_report(&mut self) {
+        if self.rearm_after_report {
+            self.eq.arm();
+            self.rearm_after_report = false;
+        }
+    }
+
+    pub(crate) fn disable_monitoring(&mut self) {
+        self.rearm_after_report = false;
+        self.monitoring_enabled = false;
+    }
+
+    pub(crate) fn monitoring_enabled(&self) -> bool {
+        self.monitoring_enabled
+    }
+
+    pub(crate) fn prepare_for_save(&mut self) {
+        while self.eq.pop().is_some() {}
+        self.rearm_after_report = false;
+        self.watchdog.clear_pending(self.interrupt.signal_count());
+        self.eq.arm();
+    }
+
+    pub(crate) fn save(self) -> InterruptCanarySavedState {
+        let state = InterruptCanarySavedState {
+            eq: self.eq.save(),
+            msix: self.msix,
+        };
+        self.resources.preserve();
+        state
+    }
+
+    pub(crate) fn into_resources(self) -> ResourceArena {
+        self.resources
+    }
+
+    pub(crate) fn quarantine(self) {
+        std::mem::forget(self);
+    }
 }
 
 impl<T: DeviceBacking> GdmaDriver<T> {
@@ -482,6 +825,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         let mut this = Self {
             device: Some(device),
             bar0,
+            shmem_poll_timer: PolledTimer::new(driver),
             dma_buffer,
             eq,
             cq,
@@ -495,6 +839,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             _pdid: pdid,
             eq_id_msix,
             num_msix,
+            max_msix_available: num_msix,
             min_queue_avail: 0,
             hwc_activity_id,
             link_toggle: Vec::new(),
@@ -502,6 +847,8 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             hwc_warning_time_in_ms: HWC_WARNING_TIME_IN_MS,
             hwc_timeout_in_ms: HWC_TIMEOUT_DEFAULT_IN_MS,
             hwc_failure: false,
+            vtl2_interrupt_canary_supported: false,
+            vtl2_interrupt_canary_reserved: false,
             state_saved: false,
             db_id,
             reset_request_pending: None,
@@ -516,11 +863,11 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         tracing::info!("Max VF resources: {:?}", max_vf_resources);
 
         let device = this.device.as_mut().expect("device should be present");
-        let num_msix = num_vps
-            .min(max_vf_resources.max_msix)
-            .min(device.max_interrupt_count());
+        let max_msix_available = max_vf_resources.max_msix.min(device.max_interrupt_count());
+        let num_msix = num_vps.min(max_msix_available);
         this.interrupts.resize_with(num_msix as usize, || None);
         this.num_msix = num_msix;
+        this.max_msix_available = max_msix_available;
         this.min_queue_avail = max_vf_resources
             .max_eq
             .min(max_vf_resources.max_sq)
@@ -558,6 +905,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             num_msix: self.num_msix,
             min_queue_avail: self.min_queue_avail,
             link_toggle: self.link_toggle.clone(),
+            max_msix_available: self.max_msix_available,
         })
     }
 
@@ -613,6 +961,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
     }
 
     pub async fn restore(
+        driver: &impl Driver,
         saved_state: GdmaDriverSavedState,
         mut device: T,
         dma_buffer: MemoryBlock,
@@ -661,6 +1010,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         let mut this = Self {
             device: Some(device),
             bar0,
+            shmem_poll_timer: PolledTimer::new(driver),
             dma_buffer,
             interrupts,
             eq,
@@ -674,6 +1024,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             gpa_mkey: saved_state.gpa_mkey,
             _pdid: saved_state.pdid,
             num_msix: saved_state.num_msix,
+            max_msix_available: saved_state.max_msix_available.max(saved_state.num_msix),
             min_queue_avail: saved_state.min_queue_avail,
             hwc_activity_id: saved_state.hwc_activity_id,
             link_toggle: saved_state.link_toggle,
@@ -681,6 +1032,8 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             hwc_warning_time_in_ms: HWC_WARNING_TIME_IN_MS,
             hwc_timeout_in_ms: HWC_TIMEOUT_DEFAULT_IN_MS,
             hwc_failure: false,
+            vtl2_interrupt_canary_supported: false,
+            vtl2_interrupt_canary_reserved: false,
             state_saved: false,
             db_id: db_id as u32,
             reset_request_pending: None,
@@ -815,10 +1168,13 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             )
         }
 
-        if num_queues_needed > self.min_queue_avail {
+        let queue_avail = self
+            .min_queue_avail
+            .saturating_sub(self.vtl2_interrupt_canary_reserved as u32);
+        if num_queues_needed > queue_avail {
             tracing::error!(
                 num_queues_needed,
-                self.min_queue_avail,
+                queue_avail,
                 "Not enough EQ's available to support all vNICs"
             )
         }
@@ -1269,7 +1625,8 @@ impl<T: DeviceBacking> GdmaDriver<T> {
                 | DRIVER_CAP_FLAG_1_HWC_TIMEOUT_RECONFIG
                 | DRIVER_CAP_FLAG_1_SELF_RESET_ON_EQE_NOTIFICATION
                 | DRIVER_CAP_FLAG_1_VTL2_REVOKE_SUB_ON_RESET_EQE
-                | DRIVER_CAP_FLAG_1_VTL2_SELECTIVE_REVOKE_SUB_ON_RESET_EQE,
+                | DRIVER_CAP_FLAG_1_VTL2_SELECTIVE_REVOKE_SUB_ON_RESET_EQE
+                | DRIVER_CAP_FLAG_1_VTL2_INTERRUPT_CANARY,
             os_type: gdma_defs::OS_TYPE_OHCL,
             os_ver_major: ver.major(),
             os_ver_minor: ver.minor(),
@@ -1300,12 +1657,16 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             anyhow::bail!("invalid protocol version");
         }
 
+        self.vtl2_interrupt_canary_supported =
+            (resp.pf_cap_flags2 & GDMA_PF_CAP_FLAG_2_VTL2_INTERRUPT_CANARY) != 0;
+
         tracing::info!(
             gdma_protocol_ver = resp.gdma_protocol_ver,
             pf_cap_flags1 = format_args!("{:#x}", resp.pf_cap_flags1),
             pf_cap_flags2 = format_args!("{:#x}", resp.pf_cap_flags2),
             pf_cap_flags3 = format_args!("{:#x}", resp.pf_cap_flags3),
             pf_cap_flags4 = format_args!("{:#x}", resp.pf_cap_flags4),
+            vtl2_interrupt_canary_supported = self.vtl2_interrupt_canary_supported,
             "GDMA PF capability flags",
         );
 
@@ -1361,13 +1722,292 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         self.eq_id_msix.remove(&eq_id);
     }
 
-    fn get_msix_for_cpu(&mut self, cpu: u32) -> anyhow::Result<u32> {
-        let msix = cpu % self.num_msix;
+    fn map_msix(&mut self, msix: u32, cpu: u32) -> anyhow::Result<()> {
         let device = self.device.as_mut().expect("device should be present");
         let interrupt = device.map_interrupt(msix, cpu)?;
+        if self.interrupts.len() <= msix as usize {
+            self.interrupts.resize_with(msix as usize + 1, || None);
+        }
         self.interrupts[msix as usize] = Some(interrupt);
+        Ok(())
+    }
 
+    fn get_msix_for_cpu(&mut self, cpu: u32) -> anyhow::Result<u32> {
+        let msix = cpu % self.num_msix;
+        self.map_msix(msix, cpu)?;
         Ok(msix)
+    }
+
+    async fn create_eq_with_msix(
+        &mut self,
+        arena: &mut ResourceArena,
+        dev_id: GdmaDevId,
+        gdma_region: u64,
+        queue_size: u32,
+        pdid: u32,
+        doorbell_id: u32,
+        msix: u32,
+    ) -> anyhow::Result<(u32, DeviceInterrupt)> {
+        let resp: GdmaCreateQueueResp = self
+            .request(
+                GdmaRequestType::GDMA_CREATE_QUEUE.0,
+                dev_id,
+                GdmaCreateQueueReq {
+                    queue_type: GdmaQueueType::GDMA_EQ,
+                    pdid,
+                    doorbell_id,
+                    gdma_region,
+                    queue_size,
+                    eq_pci_msix_index: msix,
+                    ..FromZeros::new_zeroed()
+                },
+            )
+            .await?;
+
+        // The EQ takes ownership of the DMA region.
+        arena.take_dma_region(gdma_region);
+        arena.push(Resource::Eq {
+            dev_id,
+            eq_id: resp.queue_index,
+        });
+        let interrupt = self.start_listening(resp.queue_index, msix);
+        Ok((resp.queue_index, interrupt))
+    }
+
+    pub(crate) async fn initialize_interrupt_canary(
+        &mut self,
+        saved_state: Option<&InterruptCanarySavedState>,
+    ) -> anyhow::Result<Option<InterruptCanary>> {
+        if saved_state.is_none() && !self.vtl2_interrupt_canary_supported {
+            return Ok(None);
+        }
+
+        if self.dma_buffer.len() < (VTL2_INTERRUPT_CANARY_EQ_PAGE + 1) * PAGE_SIZE {
+            tracing::warn!(
+                dma_buffer_len = self.dma_buffer.len(),
+                "VTL2 interrupt canary DMA page is unavailable"
+            );
+            return Ok(None);
+        }
+
+        let eq_mem = self
+            .dma_buffer
+            .subblock(VTL2_INTERRUPT_CANARY_EQ_PAGE * PAGE_SIZE, PAGE_SIZE);
+
+        if let Some(saved_state) = saved_state {
+            let max_interrupt_count = self
+                .device
+                .as_ref()
+                .expect("device should be present")
+                .max_interrupt_count();
+            if saved_state.msix >= max_interrupt_count {
+                anyhow::bail!(
+                    "saved interrupt canary MSI-X {} exceeds device limit {}",
+                    saved_state.msix,
+                    max_interrupt_count
+                );
+            }
+
+            self.map_msix(saved_state.msix, 0)?;
+            let eq = Eq::restore_eq(
+                eq_mem.clone(),
+                saved_state.eq.clone(),
+                DoorbellPage::new(self.bar0.clone(), self.db_id)?,
+            );
+            let interrupt = self.start_listening(eq.id(), saved_state.msix);
+            let resources = ResourceArena::restore_eq(eq_mem, HWC_DEV_ID, eq.id());
+            self.vtl2_interrupt_canary_reserved = true;
+            return Ok(Some(InterruptCanary::restore(
+                eq,
+                interrupt,
+                resources,
+                saved_state.msix,
+            )));
+        }
+
+        if self.num_msix == 0
+            || self.max_msix_available <= self.num_msix
+            || self.min_queue_avail == 0
+        {
+            tracing::warn!(
+                data_msix = self.num_msix,
+                max_msix_available = self.max_msix_available,
+                min_queue_avail = self.min_queue_avail,
+                "VTL2 interrupt canary requires one spare EQ and MSI-X vector"
+            );
+            return Ok(None);
+        }
+
+        let msix = self.num_msix;
+        self.map_msix(msix, 0)?;
+
+        let mut resources = ResourceArena::new();
+        let gdma_region = self
+            .create_dma_region(&mut resources, HWC_DEV_ID, eq_mem.clone())
+            .await?;
+        let (eq_id, interrupt) = match self
+            .create_eq_with_msix(
+                &mut resources,
+                HWC_DEV_ID,
+                gdma_region,
+                PAGE_SIZE as u32,
+                self._pdid,
+                self.db_id,
+                msix,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                resources.destroy(self).await;
+                return Err(err);
+            }
+        };
+
+        let eq = Eq::new_eq(
+            eq_mem,
+            DoorbellPage::new(self.bar0.clone(), self.db_id)?,
+            eq_id,
+        );
+        self.vtl2_interrupt_canary_reserved = true;
+        Ok(Some(InterruptCanary::new(eq, interrupt, resources, msix)))
+    }
+
+    pub(crate) async fn configure_interrupt_canary(
+        &mut self,
+        request: GdmaConfigureVtl2InterruptCanaryReq,
+    ) -> anyhow::Result<()> {
+        if !self.vtl2_interrupt_canary_supported {
+            if request.enable == 0 {
+                return Ok(());
+            }
+            anyhow::bail!("VTL2 interrupt canary is not supported by the PF");
+        }
+
+        self.request(
+            GdmaRequestType::GDMA_CONFIGURE_VTL2_INTERRUPT_CANARY.0,
+            HWC_DEV_ID,
+            request,
+        )
+        .await
+    }
+
+    pub(crate) fn interrupt_canary_supported(&self) -> bool {
+        self.vtl2_interrupt_canary_supported
+    }
+
+    pub(crate) fn mark_hwc_failure(&mut self) {
+        self.hwc_failure = true;
+    }
+
+    async fn wait_for_interrupt_canary_shmem(&mut self) -> Option<SmcProtoHdr> {
+        let shmem_header = self.bar0.map.vf_gdma_sriov_shared_reg_start as usize + 28;
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(VTL2_INTERRUPT_CANARY_SHMEM_TIMEOUT_MS);
+
+        loop {
+            let value = self.bar0.mem.read_u32(shmem_header);
+            if value == u32::MAX {
+                tracing::error!("device no longer present while reporting interrupt canary");
+                return None;
+            }
+
+            let header = SmcProtoHdr::from(value);
+            if !header.owner_is_pf() {
+                return Some(header);
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::error!("timed out waiting for interrupt canary SHMEM ownership");
+                return None;
+            }
+            self.shmem_poll_timer
+                .sleep(Duration::from_millis(VTL2_INTERRUPT_CANARY_SHMEM_POLL_MS))
+                .await;
+        }
+    }
+
+    pub(crate) async fn report_interrupt_canary(&mut self, report: InterruptCanaryReport) -> bool {
+        if self.reset_request_pending.is_some() || !self.vtl2_interrupt_canary_supported {
+            return false;
+        }
+
+        let shmem_base = self.bar0.map.vf_gdma_sriov_shared_reg_start as usize;
+        if self.wait_for_interrupt_canary_shmem().await.is_none() {
+            return false;
+        }
+
+        let result = match report.failure {
+            InterruptCanaryFailure::EqePendingNoInterrupt => {
+                SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_EQE_PENDING_NO_INTERRUPT
+            }
+            InterruptCanaryFailure::EqePendingAfterInterrupt => {
+                SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_EQE_PENDING_AFTER_INTERRUPT
+            }
+            InterruptCanaryFailure::InterruptWithoutEqe => {
+                SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_INTERRUPT_NO_EQE
+            }
+            InterruptCanaryFailure::UnexpectedEqe => {
+                SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_UNEXPECTED_EQE
+            }
+            InterruptCanaryFailure::SequenceMismatch => {
+                SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_SEQUENCE_MISMATCH
+            }
+        };
+        let params = SMC_GDMA_VTL2_INTERRUPT_CANARY_VALID
+            | SMC_GDMA_VTL2_INTERRUPT_CANARY_LEGACY_PROBE
+            | (result << SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_SHIFT)
+            | report
+                .pending_ms
+                .min(SMC_GDMA_VTL2_INTERRUPT_CANARY_PENDING_MS_MASK);
+        let payload = [
+            report.generation,
+            report.expected_sequence,
+            report.observed_sequence,
+            report.queue_id,
+            report.eq_next,
+            report.interrupt_count,
+            params,
+        ];
+        for (index, value) in payload.into_iter().enumerate() {
+            self.bar0.mem.write_u32(shmem_base + index * 4, value);
+        }
+        safe_intrinsics::store_fence();
+        let header = SmcProtoHdr::new()
+            .with_msg_type(SmcMessageType::SMC_MSG_TYPE_REPORT_HWC_TIMEOUT.0)
+            .with_msg_version(SMC_MSG_TYPE_REPORT_VTL2_INTERRUPT_CANARY_VERSION);
+        self.bar0.mem.write_u32(
+            shmem_base + 28,
+            u32::from_le_bytes(header.as_bytes().try_into().expect("known size")),
+        );
+
+        let Some(response) = self.wait_for_interrupt_canary_shmem().await else {
+            return false;
+        };
+        if !response.is_response() || response.status() != 0 {
+            tracing::error!(
+                generation = report.generation,
+                expected_sequence = report.expected_sequence,
+                observed_sequence = report.observed_sequence,
+                is_response = response.is_response(),
+                status = response.status(),
+                "VTL2 interrupt canary SHMEM report failed"
+            );
+            return false;
+        }
+
+        tracing::error!(
+            generation = report.generation,
+            expected_sequence = report.expected_sequence,
+            observed_sequence = report.observed_sequence,
+            queue_id = report.queue_id,
+            eq_next = report.eq_next,
+            interrupt_count = report.interrupt_count,
+            poll_count = report.poll_count,
+            pending_ms = report.pending_ms,
+            failure = ?report.failure,
+            "reported VTL2 interrupt canary failure"
+        );
+        true
     }
 
     #[tracing::instrument(skip(self), level = "debug", err)]
@@ -1413,32 +2053,19 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         cpu: u32,
     ) -> anyhow::Result<(u32, DeviceInterrupt)> {
         let msix = self.get_msix_for_cpu(cpu)?;
-        let resp: GdmaCreateQueueResp = self
-            .request(
-                GdmaRequestType::GDMA_CREATE_QUEUE.0,
+        let result = self
+            .create_eq_with_msix(
+                arena,
                 dev_id,
-                GdmaCreateQueueReq {
-                    queue_type: GdmaQueueType::GDMA_EQ,
-                    pdid,
-                    doorbell_id,
-                    gdma_region,
-                    queue_size,
-                    eq_pci_msix_index: msix,
-                    ..FromZeros::new_zeroed()
-                },
+                gdma_region,
+                queue_size,
+                pdid,
+                doorbell_id,
+                msix,
             )
             .await?;
-
-        // The eq takes ownership of the DMA region.
-        arena.take_dma_region(gdma_region);
-
-        arena.push(Resource::Eq {
-            dev_id,
-            eq_id: resp.queue_index,
-        });
-        tracing::trace!(id = resp.queue_index, cpu, msix, "created eq",);
-        let interrupt = self.start_listening(resp.queue_index, msix);
-        Ok((resp.queue_index, interrupt))
+        tracing::trace!(id = result.0, cpu, msix, "created eq",);
+        Ok(result)
     }
 
     #[tracing::instrument(skip(self), level = "debug", err)]
@@ -1509,5 +2136,108 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             GdmaDestroyDmaRegionReq { gdma_region },
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod interrupt_canary_tests {
+    use super::*;
+
+    #[test]
+    fn pending_eqe_is_reported_once() {
+        let mut watchdog = InterruptCanaryWatchdog::default();
+        let event = Some((GDMA_EQE_TEST_EVENT, 7));
+
+        for _ in 1..VTL2_INTERRUPT_CANARY_PENDING_POLLS {
+            assert_eq!(watchdog.observe(event, 0, 0), None);
+        }
+        assert_eq!(
+            watchdog.observe(event, 0, 0),
+            Some((
+                InterruptCanaryFailure::EqePendingNoInterrupt,
+                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS
+            ))
+        );
+        assert_eq!(watchdog.observe(event, 0, 0), None);
+    }
+
+    #[test]
+    fn a_new_sequence_starts_a_new_watchdog_window() {
+        let mut watchdog = InterruptCanaryWatchdog::default();
+        for _ in 0..VTL2_INTERRUPT_CANARY_PENDING_POLLS {
+            let _ = watchdog.observe(Some((GDMA_EQE_TEST_EVENT, 7)), 0, 0);
+        }
+
+        assert_eq!(watchdog.observe(Some((GDMA_EQE_TEST_EVENT, 8)), 0, 0), None);
+        assert_eq!(watchdog.pending_polls, 1);
+    }
+
+    #[test]
+    fn clearing_the_queue_resets_pending_detection() {
+        let mut watchdog = InterruptCanaryWatchdog::default();
+        for _ in 0..5 {
+            assert_eq!(watchdog.observe(Some((GDMA_EQE_TEST_EVENT, 7)), 0, 0), None);
+        }
+
+        assert_eq!(watchdog.observe(None, 0, 0), None);
+        assert_eq!(watchdog.pending_event, None);
+        assert_eq!(watchdog.pending_polls, 0);
+    }
+
+    #[test]
+    fn unexpected_event_is_classified() {
+        let mut watchdog = InterruptCanaryWatchdog::default();
+        let mut result = None;
+        for _ in 0..VTL2_INTERRUPT_CANARY_PENDING_POLLS {
+            result = watchdog.observe(Some((0xff, 9)), 0, 0);
+        }
+
+        assert_eq!(
+            result,
+            Some((
+                InterruptCanaryFailure::UnexpectedEqe,
+                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS
+            ))
+        );
+    }
+
+    #[test]
+    fn pending_eqe_after_interrupt_is_distinguished() {
+        let mut watchdog = InterruptCanaryWatchdog::default();
+        let event = Some((GDMA_EQE_TEST_EVENT, 7));
+
+        assert_eq!(watchdog.observe(event, 1, 1), None);
+        let mut result = None;
+        for _ in 1..VTL2_INTERRUPT_CANARY_PENDING_POLLS {
+            result = watchdog.observe(event, 1, 1);
+        }
+
+        assert_eq!(
+            result,
+            Some((
+                InterruptCanaryFailure::EqePendingAfterInterrupt,
+                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS
+            ))
+        );
+    }
+
+    #[test]
+    fn interrupt_racing_with_empty_sample_is_not_lost() {
+        let mut watchdog = InterruptCanaryWatchdog::default();
+        assert_eq!(watchdog.observe(None, 0, 1), None);
+
+        let event = Some((GDMA_EQE_TEST_EVENT, 7));
+        let mut result = None;
+        for _ in 0..VTL2_INTERRUPT_CANARY_PENDING_POLLS {
+            result = watchdog.observe(event, 1, 1);
+        }
+
+        assert_eq!(
+            result,
+            Some((
+                InterruptCanaryFailure::EqePendingAfterInterrupt,
+                VTL2_INTERRUPT_CANARY_PENDING_POLLS * VTL2_INTERRUPT_CANARY_POLL_INTERVAL_MS
+            ))
+        );
     }
 }

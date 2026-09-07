@@ -7,6 +7,8 @@ use parking_lot::Mutex;
 use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::Ordering::Release;
@@ -53,10 +55,16 @@ impl DeviceInterrupt {
     pub async fn wait(&mut self) {
         poll_fn(|cx| self.poll(cx)).await
     }
+
+    /// Returns the number of times this interrupt target has been signaled.
+    pub fn signal_count(&self) -> u64 {
+        self.slot.signal_count.load(Acquire)
+    }
 }
 
 struct DeviceInterruptSlot {
     signaled: AtomicBool,
+    signal_count: AtomicU64,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -64,6 +72,7 @@ impl DeviceInterruptSlot {
     fn new() -> Self {
         Self {
             signaled: AtomicBool::new(false),
+            signal_count: AtomicU64::new(0),
             waker: Mutex::new(None),
         }
     }
@@ -88,6 +97,7 @@ impl DeviceInterruptSlot {
     }
 
     fn signal(&self) {
+        self.signal_count.fetch_add(1, AcqRel);
         self.signaled.store(true, Release);
         if let Some(waker) = self.waker.lock().take() {
             waker.wake();
@@ -171,11 +181,15 @@ mod tests {
     async fn test_interrupt(driver: DefaultDriver) {
         let mut source = DeviceInterruptSource::new();
         let mut target = source.new_target();
+        assert_eq!(target.signal_count(), 0);
         source.signal();
+        assert_eq!(target.signal_count(), 1);
         target.wait().await;
         let mut target_clone = target.clone();
+        assert_eq!(target_clone.signal_count(), 0);
         let task = driver.spawn("test", async move { target_clone.wait().await });
         source.signal();
+        assert_eq!(target.signal_count(), 2);
         task.await;
         target.wait().await;
     }

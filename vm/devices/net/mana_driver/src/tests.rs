@@ -8,6 +8,8 @@ use crate::bnic_driver::BnicDriver;
 use crate::bnic_driver::RxConfig;
 use crate::bnic_driver::WqConfig;
 use crate::gdma_driver::GdmaDriver;
+use crate::gdma_driver::InterruptCanaryFailure;
+use crate::gdma_driver::InterruptCanaryReport;
 use crate::mana::ResourceArena;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use gdma::VportConfig;
@@ -196,12 +198,134 @@ async fn test_gdma_save_restore(driver: DefaultDriver) {
         gdma.save().await.unwrap()
     };
 
-    let mut new_gdma = GdmaDriver::restore(saved_state, cloned_device, gdma_buffer)
+    let mut new_gdma = GdmaDriver::restore(&driver, saved_state, cloned_device, gdma_buffer)
         .await
         .unwrap();
 
     // Validate that the new driver still works after restoration.
     new_gdma.test_eq().await.unwrap();
+}
+
+#[async_test]
+async fn test_vtl2_interrupt_canary(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_vtl2_interrupt_canary");
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(7 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let mut canary = gdma
+        .initialize_interrupt_canary(None)
+        .await
+        .unwrap()
+        .expect("emulator advertises interrupt canary support");
+    canary.prepare_registration();
+    let mut interrupt = canary.interrupt();
+
+    gdma.configure_interrupt_canary(canary.registration(true))
+        .await
+        .unwrap();
+    interrupt.wait().await;
+    assert!(canary.process_interrupt().is_none());
+    assert!(
+        gdma.report_interrupt_canary(InterruptCanaryReport {
+            generation: canary.registration(true).generation,
+            expected_sequence: 2,
+            observed_sequence: 2,
+            queue_id: canary.registration(true).queue_index,
+            eq_next: 0,
+            interrupt_count: 1,
+            poll_count: 1,
+            pending_ms: 250,
+            failure: InterruptCanaryFailure::EqePendingNoInterrupt,
+        })
+        .await
+    );
+    gdma.test_eq().await.unwrap();
+
+    gdma.configure_interrupt_canary(canary.registration(false))
+        .await
+        .unwrap();
+    canary.into_resources().destroy(&mut gdma).await;
+}
+
+#[async_test]
+async fn test_vtl2_interrupt_canary_save_restore(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_vtl2_interrupt_canary_save_restore");
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let restored_device = device.clone();
+    let dma_client = device.dma_client();
+    let gdma_buffer = dma_client.allocate_dma_buffer(7 * PAGE_SIZE).unwrap();
+
+    let (saved_gdma, saved_canary) = {
+        let mut gdma = GdmaDriver::new(&driver, device, 1, Some(gdma_buffer.clone()))
+            .await
+            .unwrap();
+        gdma.verify_vf_driver_version().await.unwrap();
+        let mut canary = gdma
+            .initialize_interrupt_canary(None)
+            .await
+            .unwrap()
+            .expect("emulator advertises interrupt canary support");
+
+        gdma.configure_interrupt_canary(canary.registration(false))
+            .await
+            .unwrap();
+        canary.prepare_for_save();
+        let saved_canary = canary.save();
+        let saved_gdma = gdma.save().await.unwrap();
+        (saved_gdma, saved_canary)
+    };
+
+    let mut gdma = GdmaDriver::restore(&driver, saved_gdma, restored_device, gdma_buffer)
+        .await
+        .unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let mut canary = gdma
+        .initialize_interrupt_canary(Some(&saved_canary))
+        .await
+        .unwrap()
+        .expect("saved interrupt canary should restore");
+    canary.prepare_registration();
+    let mut interrupt = canary.interrupt();
+
+    gdma.configure_interrupt_canary(canary.registration(true))
+        .await
+        .unwrap();
+    interrupt.wait().await;
+    assert!(canary.process_interrupt().is_none());
+
+    gdma.configure_interrupt_canary(canary.registration(false))
+        .await
+        .unwrap();
+    canary.into_resources().destroy(&mut gdma).await;
 }
 
 #[async_test]

@@ -62,6 +62,27 @@ impl ResourceArena {
         self.resources.remove(i);
     }
 
+    pub(crate) fn restore_eq(mem: MemoryBlock, dev_id: GdmaDevId, eq_id: u32) -> Self {
+        Self {
+            resources: vec![
+                Resource::MemoryBlock(ManuallyDrop::new(mem)),
+                Resource::Eq { dev_id, eq_id },
+            ],
+        }
+    }
+
+    pub(crate) fn preserve(mut self) {
+        for resource in self.resources.drain(..) {
+            match resource {
+                Resource::MemoryBlock(mem) => drop(ManuallyDrop::into_inner(mem)),
+                Resource::Eq { .. } => {}
+                Resource::DmaRegion { .. } | Resource::BnicQueue { .. } => {
+                    panic!("only a fully-created EQ can be preserved")
+                }
+            }
+        }
+    }
+
     pub(crate) async fn destroy<T: DeviceBacking>(mut self, gdma: &mut GdmaDriver<T>) {
         let skip_hwc = gdma.get_reset_request_pending().is_some();
         if skip_hwc {

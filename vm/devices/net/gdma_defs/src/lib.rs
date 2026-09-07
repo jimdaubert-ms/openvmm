@@ -104,6 +104,17 @@ open_enum! {
 pub const SMC_MSG_TYPE_ESTABLISH_HWC_VERSION: u8 = 0;
 pub const SMC_MSG_TYPE_DESTROY_HWC_VERSION: u8 = 0;
 pub const SMC_MSG_TYPE_REPORT_HWC_TIMEOUT_VERSION: u8 = 1;
+pub const SMC_MSG_TYPE_REPORT_VTL2_INTERRUPT_CANARY_VERSION: u8 = 3;
+
+pub const SMC_GDMA_VTL2_INTERRUPT_CANARY_PENDING_MS_MASK: u32 = 0x00ff_ffff;
+pub const SMC_GDMA_VTL2_INTERRUPT_CANARY_LEGACY_PROBE: u32 = 1 << 26;
+pub const SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_SHIFT: u32 = 28;
+pub const SMC_GDMA_VTL2_INTERRUPT_CANARY_VALID: u32 = 1 << 31;
+pub const SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_EQE_PENDING_NO_INTERRUPT: u32 = 1;
+pub const SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_EQE_PENDING_AFTER_INTERRUPT: u32 = 2;
+pub const SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_INTERRUPT_NO_EQE: u32 = 3;
+pub const SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_UNEXPECTED_EQE: u32 = 4;
+pub const SMC_GDMA_VTL2_INTERRUPT_CANARY_RESULT_SEQUENCE_MISMATCH: u32 = 5;
 
 #[repr(C)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -322,6 +333,7 @@ open_enum! {
         GDMA_DMA_REGION_ADD_PAGES = 26,
         GDMA_DESTROY_DMA_REGION = 27,
         GDMA_CHANGE_MSIX_FOR_EQ = 81,
+        GDMA_CONFIGURE_VTL2_INTERRUPT_CANARY = 134,
     }
 }
 
@@ -383,6 +395,19 @@ pub struct GdmaRespHdr {
 #[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct GdmaGenerateTestEventReq {
     pub queue_index: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaConfigureVtl2InterruptCanaryReq {
+    pub queue_index: u32,
+    pub enable: u32,
+    pub poll_interval_ms: u32,
+    pub min_delay_ms: u32,
+    pub max_delay_ms: u32,
+    pub completion_timeout_ms: u32,
+    pub generation: u32,
+    pub reserved: u32,
 }
 
 #[repr(C)]
@@ -464,6 +489,7 @@ pub const DRIVER_CAP_FLAG_1_HW_VPORT_LINK_AWARE: u64 = 0x40;
 pub const DRIVER_CAP_FLAG_1_SELF_RESET_ON_EQE_NOTIFICATION: u64 = 0x4000;
 pub const DRIVER_CAP_FLAG_1_VTL2_REVOKE_SUB_ON_RESET_EQE: u64 = 0x10000;
 pub const DRIVER_CAP_FLAG_1_VTL2_SELECTIVE_REVOKE_SUB_ON_RESET_EQE: u64 = 0x8000000;
+pub const DRIVER_CAP_FLAG_1_VTL2_INTERRUPT_CANARY: u64 = 0x2_0000_0000;
 
 pub const OS_TYPE_OHCL: u32 = 0x60;
 
@@ -492,6 +518,7 @@ pub struct GdmaVerifyVerReq {
 
 pub const GDMA_PF_CAP_FLAG_1_QUERY_HWC_TIMEOUT: u64 = 0x08;
 pub const GDMA_PF_CAP_FLAG_1_EQE_REQUEST_VF_SELF_RESET: u64 = 0x80;
+pub const GDMA_PF_CAP_FLAG_2_VTL2_INTERRUPT_CANARY: u64 = 0x02;
 
 #[repr(C)]
 #[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
